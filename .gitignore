@@ -1,5 +1,4 @@
 node_modules/
-/dist/
 automation-service/dist/
 automation-service/.tmp/
 .codex-tmp/
