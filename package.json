@@ -1,0 +1,37 @@
+{
+  "name": "duowei-print-sidebar",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "dev": "cross-env NODE_ENV=development webpack-dev-server --mode development --config webpack.config.cjs",
+    "build": "vue-tsc -b && cross-env NODE_ENV=production webpack --mode production --config webpack.config.cjs",
+    "check": "vue-tsc -b --force"
+  },
+  "dependencies": {
+    "@lark-base-open/js-sdk": "1.0.2",
+    "vue": "3.5.13",
+    "vue-print-designer": "1.7.39"
+  },
+  "devDependencies": {
+    "@vue/tsconfig": "0.7.0",
+    "cross-env": "7.0.3",
+    "css-loader": "7.1.5",
+    "html-webpack-plugin": "5.6.8",
+    "style-loader": "4.0.0",
+    "ts-loader": "9.6.2",
+    "typescript": "5.8.3",
+    "vue-loader": "17.4.2",
+    "vue-tsc": "2.2.8",
+    "webpack": "5.111.1",
+    "webpack-cli": "6.0.1",
+    "webpack-dev-server": "5.2.6"
+  },
+  "overrides": {
+    "lodash.template": "4.5.0"
+  },
+  "engines": {
+    "node": ">=22.6"
+  }
+}
