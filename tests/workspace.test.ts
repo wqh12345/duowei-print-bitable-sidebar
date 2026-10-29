@@ -71,9 +71,9 @@ test("SPEC-UX-05/SPEC-SAVE-03: a new unsaved template stays dirty even with iden
 });
 
 test("SPEC-BATCH-08: continuing an explicit batch request must not claim the host switched", () => {
-  assert.equal(contextDecisionCancelStatus("batch"), "已保留当前模板草稿");
-  assert.equal(contextDecisionCancelStatus("current"), "已保留当前模板草稿");
-  assert.match(contextDecisionCancelStatus(null), /宿主记录已切换/);
+  assert.equal(contextDecisionCancelStatus("batch"), "未保存的修改已保留");
+  assert.equal(contextDecisionCancelStatus("current"), "未保存的修改已保留");
+  assert.match(contextDecisionCancelStatus(null), /请先处理，再读取新记录/);
 });
 
 test("SPEC-BATCH-08: transient selection events do not clear an explicit load request", () => {

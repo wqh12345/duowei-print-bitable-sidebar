@@ -200,7 +200,7 @@ test("CT-BATCH-09-EDIT: App replaces the example switcher with one full-batch ed
 test("SPEC-UX-13/14/CT-TPL-06: components remain editable while batch layouts stop creating templates", () => {
   const source = readFileSync("src/App.vue", "utf8");
   assert.match(source, /components:\s*"组件"/);
-  assert.match(source, /选中画布中的组件后，可在右侧属性面板/);
+  assert.match(source, /选中组件后在右侧属性面板设置/);
   assert.match(source, /TEMPLATE_CREATION_OPTIONS/);
   assert.match(source, /createTemplate\(option\.kind\)/);
   assert.doesNotMatch(source, />默认模板<\/strong><small>每条记录从新页开始/);

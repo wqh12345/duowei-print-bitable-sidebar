@@ -5,6 +5,6 @@ export const TEMPLATE_CREATION_OPTIONS: ReadonlyArray<{
   label: string;
   description: string;
 }> = [
-  { kind: "blank", label: "空白模板", description: "从空白纸张开始设计" },
-  { kind: "automatic", label: "自动生成模板", description: "根据当前表字段生成初始排版" },
+  { kind: "blank", label: "空白模板", description: "从空白纸张开始排版" },
+  { kind: "automatic", label: "自动生成模板", description: "按当前表字段自动生成排版" },
 ] as const;

@@ -55,7 +55,7 @@ export function getBatchWorkspaceActionState(
     recordPickerDisabled: input.busy || !input.canEdit,
     outputBlockReason: input.canEdit
       ? ""
-      : "当前文档为阅读权限，模板编辑与打印输出均不可用",
+      : "没有编辑权限，无法修改模板或打印",
     selectLabel: isBatchMode ? "重新选择" : "选择打印记录",
     printLabel: isBatchMode ? `打印 ${count} 条` : "打印",
     exportPdfLabel: isBatchMode ? `导出 ${count} 条 PDF` : "导出 PDF",

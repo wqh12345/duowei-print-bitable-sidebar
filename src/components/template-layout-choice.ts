@@ -9,9 +9,9 @@ export const BATCH_LAYOUT_OPTIONS: ReadonlyArray<{
   label: string;
   description: string;
 }> = [
-  { kind: "default", label: "默认排版", description: "每条记录按完整模板分别分页" },
-  { kind: "continuous", label: "连续排版", description: "多条记录在一张长纸中连续排列" },
-  { kind: "labels", label: "标签排版", description: "按标签行列与间距批量铺排" },
+  { kind: "default", label: "默认排版", description: "每条记录独立一页" },
+  { kind: "continuous", label: "连续排版", description: "多条记录连排成一张长纸" },
+  { kind: "labels", label: "标签排版", description: "按行列与间距铺成标签页" },
 ] as const;
 
 type JsonRecord = Record<string, any>;

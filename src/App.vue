@@ -406,7 +406,7 @@ function invalidateContext() {
   batchSession.value = createSinglePrintSession(null);
   renderedPages.value = null;
   batchPreviewStale.value = false;
-  status.value = "当前记录已切换，请重新读取";
+  status.value = "表格中切换了记录，请点击「选择记录」重新读取";
 }
 
 async function assertCurrentContext(expected: FeishuSelection, revision: number) {
@@ -467,7 +467,7 @@ async function loadRecords(useBatchPicker = false) {
         selection.value = active;
         await assertCurrentContext(active, revision);
       } else {
-        status.value = "尚未选择打印记录，请点击「选择记录」";
+        status.value = "先点击「选择记录」，勾选要打印的记录";
         return;
       }
     }
@@ -476,7 +476,6 @@ async function loadRecords(useBatchPicker = false) {
     batchSession.value = createSinglePrintSession(active.recordId);
     selection.value = active;
     printJob.value = job;
-    status.value = "已加载 " + printJob.value.documents.length + " 条记录";
     await nextTick();
     await waitForDesignerReady();
     if (candidateRender) await candidateRender.catch(() => undefined);
@@ -484,8 +483,8 @@ async function loadRecords(useBatchPicker = false) {
     await loadTemplateAndPreview(job, active, revision);
   } catch (cause) {
     if (revision === contextRevision) {
-      error.value = cause instanceof Error ? cause.message : "读取飞书数据失败";
-      status.value = "加载失败";
+      error.value = cause instanceof Error ? cause.message : "无法读取表格数据，请稍后重试";
+      status.value = "读取失败，请重试";
     }
   } finally {
     if (revision === contextRevision) busy.value = false;
@@ -522,10 +521,7 @@ async function loadBatchCandidate(retryRequest?: BatchRetryRequest, preselectedI
         ? [...preselectedIds]
         : await selectRecordIds(active);
     if (!retryRequest) await assertCurrentContext(active, revision);
-    if (!ids.length) {
-      status.value = "未更改打印记录";
-      return;
-    }
+    if (!ids.length) return;
     if (!candidateRequest) {
       if (!selectedTemplateId.value) throw new Error("请先选择打印模板");
       candidateRequest = createBatchRetryRequest(active, selectedTemplateId.value, ids);
@@ -548,7 +544,7 @@ async function loadBatchCandidate(retryRequest?: BatchRetryRequest, preselectedI
         await bindPrintJob(designer, layout.effectiveTemplate, job);
         pending = renderPrintJobCandidate(
           designer, previous, job,
-          (current, total) => { status.value = `正在生成批次预览 ${current}/${total}`; },
+          (current, total) => { status.value = `正在生成批量预览（${current}/${total}）`; },
           () => revision === contextRevision,
         );
         candidateRender = pending;
@@ -586,7 +582,7 @@ async function loadBatchCandidate(retryRequest?: BatchRetryRequest, preselectedI
     previewError.value = "";
     batchRetryRequest.value = null;
     workspaceMode.value = "preview";
-    status.value = `已为当前模板保存 ${ids.length} 条记录，批次预览已生成`;
+    status.value = `已为当前模板选择 ${ids.length} 条记录，预览已生成`;
   } catch (cause) {
     if (revision === contextRevision) {
       if (designer && previous && previousDesignerTemplate) {
@@ -602,7 +598,7 @@ async function loadBatchCandidate(retryRequest?: BatchRetryRequest, preselectedI
       error.value = savingSelection
         ? `打印记录未保存：${cause instanceof Error ? cause.message : "飞书存储写入失败"}`
         : feedback.error;
-      status.value = savingSelection ? "记录选择未保存，原预览已保留" : feedback.status;
+      status.value = savingSelection ? "记录未保存，原预览仍可用" : feedback.status;
     }
   } finally {
     if (candidateRender === pending) candidateRender = null;
@@ -669,7 +665,7 @@ async function exitBatchMode() {
     batchPreviewStale.value = false;
     previewError.value = "";
     workspaceMode.value = "preview";
-    status.value = "已清除当前模板保存的打印记录，返回当前记录";
+    status.value = "已清除批量记录，回到只打印当前记录";
   } catch (cause) {
     if (revision === contextRevision) {
       if (designer && previous && previousDesignerTemplate) {
@@ -679,8 +675,8 @@ async function exitBatchMode() {
           // Keep the committed batch preview as the visible fallback.
         }
       }
-      error.value = cause instanceof Error ? cause.message : "返回当前记录失败；原批次已保留";
-      status.value = "原批次已保留";
+      error.value = cause instanceof Error ? cause.message : "未能回到当前记录，原批量打印仍保留";
+      status.value = "未能回到当前记录";
     }
   } finally {
     if (candidateRender === pending) candidateRender = null;
@@ -761,11 +757,7 @@ async function loadTemplateAndPreview(
     renderedPages.value = null;
     previewHtml.value = "";
     if (warning) {
-      status.value = "已加载当前记录和动态数据源；旧模板暂不可保存";
-    } else {
-      status.value = stored
-        ? "已加载所选模板并绑定真实数据"
-        : "已自动生成模板并绑定真实数据";
+      status.value = "已加载当前记录；旧模板暂不可保存";
     }
     previewHtml.value = "";
     previewError.value = "";
@@ -778,13 +770,12 @@ async function loadTemplateAndPreview(
     } catch (cause) {
       if (revision !== contextRevision) return false;
       previewError.value = cause instanceof Error ? cause.message : "打印预览生成失败";
-      status.value = "模板已加载，预览生成失败";
     }
     return true;
   } catch (cause) {
     if (revision === contextRevision) {
-      error.value = cause instanceof Error ? cause.message : "打印模板加载失败";
-      status.value = "模板加载失败";
+      error.value = cause instanceof Error ? cause.message : "无法打开模板，请重试";
+      status.value = "模板读取失败，请重试";
     }
     return false;
   } finally {
@@ -858,7 +849,7 @@ async function flushBatchProjectionSync(): Promise<boolean> {
   } catch (cause) {
     const syncError = cause instanceof Error ? cause : new Error("批量模板同步失败");
     error.value = syncError.message;
-    status.value = "批量模板修改未同步，请撤销冲突修改后重试";
+    status.value = "批量打印的模板已变更，请重新编辑后再保存";
     throw syncError;
   }
 }
@@ -905,13 +896,12 @@ async function refreshPreview(): Promise<boolean> {
     renderedPages.value = rendered;
     previewHtml.value = composeRenderedPrintPages(rendered);
     batchPreviewStale.value = false;
-    status.value = "打印预览已刷新";
     return true;
   } catch (cause) {
     if (revision === contextRevision) {
       previewError.value = cause instanceof Error ? cause.message : "打印预览生成失败";
       previewHtml.value = "";
-      status.value = "预览失败";
+      status.value = "预览未生成，可点击「重试预览」";
     }
     return false;
   } finally {
@@ -932,7 +922,7 @@ function markDesignerReady() {
       onChange: refreshTemplateDirtyState,
       onError: (cause) => {
         error.value = cause.message;
-        status.value = "数据源内容未能同步";
+        status.value = "字段内容未更新到模板，请重试";
       },
     });
     stopDesignerTemplatePanelSuppression = installDesignerTemplatePanelSuppression(window);
@@ -946,7 +936,7 @@ function markDesignerReady() {
 function handleDesignerLoadError(event: Event) {
   const cause = (event as CustomEvent<unknown>).detail;
   error.value = cause instanceof Error ? cause.message : "打印设计器资源加载失败";
-  status.value = "打印设计器初始化失败，请检查网络后重开插件";
+  status.value = "打印设计器加载失败，请检查网络后重新打开插件";
 }
 
 async function previewOutput() {
@@ -1019,11 +1009,11 @@ async function saveTemplate(options: { returnToPreview?: boolean; allowContextCh
     // The editor can keep a bound runtime projection after persistence. Compare
     // future edits with that same live projection, not the stored canonical data.
     captureTemplateBaseline();
-    status.value = "模板已保存（未写入当前记录值）";
+    status.value = "模板已保存";
     if (batchEditing && renderFailure) {
       batchPreviewStale.value = true;
       error.value = `模板已保存，但批量预览刷新失败：${renderFailure.message}`;
-      status.value = "模板已保存，原批量预览仍保留；请重试刷新";
+      status.value = "模板已保存，批量预览暂未刷新，可点击重试";
       return false;
     }
     if (renderedBatch) {
@@ -1032,7 +1022,7 @@ async function saveTemplate(options: { returnToPreview?: boolean; allowContextCh
       previewError.value = "";
       batchPreviewStale.value = false;
       workspaceMode.value = "preview";
-      status.value = `模板已保存，已按 ${batchSession.value.committedRecordIds.length} 条记录刷新批量预览`;
+      status.value = `模板已保存，${batchSession.value.committedRecordIds.length} 条记录预览已同步刷新`;
     } else if (options.returnToPreview) {
       workspaceMode.value = "preview";
     }
@@ -1040,7 +1030,7 @@ async function saveTemplate(options: { returnToPreview?: boolean; allowContextCh
   } catch (cause) {
     if (revision === contextRevision) {
       error.value = cause instanceof Error ? cause.message : "打印模板保存失败";
-      status.value = "模板未保存";
+      status.value = "未能保存，修改仍在画布中，请重试";
     }
     return false;
   } finally {
@@ -1118,13 +1108,13 @@ async function createTemplate(
     captureTemplateBaseline();
     workspaceMode.value = "edit";
     activeEditorPanel.value = "data-sources";
-    const createdStatus = kind === "blank" ? "已创建未保存空白模板草稿" : "已创建未保存自动模板草稿";
-    status.value = exitsOwnedBatch ? `已退出原模板批量；${createdStatus}` : createdStatus;
+    const createdStatus = kind === "blank" ? "已新建空白模板，保存后生效" : "已自动生成新模板，保存后生效";
+    status.value = exitsOwnedBatch ? `已退出批量打印；${createdStatus}` : createdStatus;
   } catch (cause) {
     const message = cause instanceof Error ? cause.message : "新模板创建失败";
     error.value = message;
     templateCreateError.value = message;
-    status.value = "新模板创建失败";
+    status.value = "模板创建失败，可点击「重试创建」";
   } finally {
     busy.value = false;
   }
@@ -1133,13 +1123,13 @@ async function createTemplate(
 async function changeBatchLayout(mode: BatchLayoutMode) {
   if (!isBatchMode.value || !designerRef.value || !printJob.value || !selection.value) return;
   if (!storedTemplate.value || selectedTemplateId.value === "automatic" || draftTemplateId.value) {
-    status.value = "请先保存当前模板，再设置批量排版";
+    status.value = "请先保存模板，再切换批量排版";
     return;
   }
   if (mode === currentBatchLayout.value) return;
   if (busy.value) return;
   if (workspaceMode.value === "edit" && refreshTemplateDirtyState()) {
-    status.value = "请先保存当前模板修改，再切换批量排版";
+    status.value = "请先保存模板，再切换批量排版";
     return;
   }
 
@@ -1212,10 +1202,10 @@ async function changeBatchLayout(mode: BatchLayoutMode) {
       captureTemplateBaseline();
       templateDirty.value = false;
     }
-    status.value = `已将当前模板切换为${BATCH_LAYOUT_OPTIONS.find((item) => item.kind === mode)?.label}`;
+    status.value = `已切换为 ${BATCH_LAYOUT_OPTIONS.find((item) => item.kind === mode)?.label} 排版`;
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : "批量排版切换失败";
-    status.value = "排版未切换，原模板和批量预览已保留";
+    status.value = "排版未切换，模板与预览保持不变";
   } finally {
     if (revision === contextRevision) busy.value = false;
   }
@@ -1317,16 +1307,14 @@ async function selectTemplate(id: string): Promise<boolean> {
     renderedPages.value = candidate.rendered;
     previewHtml.value = composeRenderedPrintPages(candidate.rendered);
     batchPreviewStale.value = false;
-    status.value = restoreWarning
-      ? "已切换模板；保存的打印记录暂时不可用"
-      : isBatchMode.value
-      ? `已恢复当前模板保存的 ${batchSession.value.committedRecordIds.length} 条记录`
-      : "已切换模板并刷新当前记录预览";
+    if (restoreWarning) {
+      status.value = "已切换模板；保存的打印记录暂时不可用";
+    }
     return true;
   } catch (cause) {
     if (revision === contextRevision) {
       error.value = cause instanceof Error ? cause.message : "模板切换失败";
-      status.value = "模板未切换，原预览已保留";
+      status.value = "模板未切换，原预览保持不变";
     }
     return false;
   } finally {
@@ -1357,13 +1345,12 @@ async function updateDirectory(
         : await templateRepository.setDefault(context, item.id, expected);
     await assertCurrentContext(active, revision);
     templateCollection.value = updated;
-    status.value = action === "rename" ? "模板已重命名" : action === "remove" ? "模板已删除" : "默认模板已更新";
     if (action === "remove" && selectedTemplateId.value === item.id) {
       nextSelection = updated.defaultId ?? "automatic";
     }
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : "模板目录操作失败";
-    status.value = "模板目录未更新";
+    status.value = "操作未完成，模板列表未变化";
     return false;
   } finally {
     busy.value = false;
@@ -1400,7 +1387,7 @@ function requestTemplateSelection(id: string) {
   if (shouldGuardUnsavedNavigation(refreshTemplateDirtyState())) {
     pendingPreviewTemplateId.value = id;
     decisionDialog.value = "leave";
-    status.value = "切换模板前，请先处理未保存的模板修改";
+    status.value = "模板有未保存的修改，请先保存或放弃";
     return;
   }
   void selectTemplate(id);
@@ -1448,14 +1435,14 @@ async function confirmTemplateManagement() {
 
 async function enterEditMode() {
   if (isBatchMode.value && !renderedPages.value) {
-    status.value = "请先等待批量预览生成完成";
+    status.value = "批量预览生成中，请稍候";
     return;
   }
   if (!canEnterTemplateEdit({
     templateLoaded: templateLoaded.value,
     templateSelected: templateSelected.value,
   })) {
-    status.value = "请先在模板目录中选择模板";
+    status.value = "请先在左侧选择要编辑的模板";
     return;
   }
   closeTransientMenus();
@@ -1486,9 +1473,6 @@ async function enterEditMode() {
     await nextTick();
     window.dispatchEvent(new Event("designer:close-properties-panel"));
     captureTemplateBaseline();
-    status.value = isBatchMode.value
-      ? `已加载 ${job.documents.length} 条记录`
-      : "已进入编辑模式";
   } catch (cause) {
     try {
       await bindPrintJob(designer, getPersistentTemplateData(designer), job);
@@ -1496,7 +1480,7 @@ async function enterEditMode() {
       // The committed preview remains visible even if the hidden designer cannot be restored.
     }
     error.value = cause instanceof Error ? cause.message : "模板编辑画布加载失败";
-    status.value = "仍保留当前打印预览";
+    status.value = "无法打开编辑画布，预览保持不变，可重试";
   } finally {
     if (revision === contextRevision) busy.value = false;
   }
@@ -1555,13 +1539,13 @@ async function restoreBatchEditBaseline(): Promise<boolean> {
       batchPreviewStale.value = false;
     }
     workspaceMode.value = "preview";
-    status.value = "已放弃修改并返回原批量预览";
+    status.value = "已放弃修改，返回批量预览";
     return true;
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : "无法恢复保存前的批量模板";
     status.value = baselineRestored
-      ? "修改已放弃，原批量预览仍保留；请重试刷新"
-      : "模板草稿仍保留";
+      ? "修改已放弃，批量预览未刷新，可重试或继续编辑"
+      : "修改已保留，未放弃";
     return false;
   } finally {
     busy.value = false;
@@ -1587,11 +1571,11 @@ async function refreshStaleBatchPreview(): Promise<boolean> {
     previewError.value = "";
     batchPreviewStale.value = false;
     workspaceMode.value = "preview";
-    status.value = `已按 ${batchSession.value.committedRecordIds.length} 条记录刷新批量预览`;
+    status.value = `已刷新 ${batchSession.value.committedRecordIds.length} 条记录的预览`;
     return true;
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : "批量预览刷新失败";
-    status.value = "原批量预览仍保留；请继续编辑或重试";
+    status.value = "批量预览未刷新，可重试或继续编辑";
     return false;
   } finally {
     busy.value = false;
@@ -1614,7 +1598,6 @@ function requestPreviewMode() {
       return;
     }
     workspaceMode.value = "preview";
-    status.value = "已返回批量预览";
     return;
   }
   void applyPreviewMode();
@@ -1642,7 +1625,7 @@ function requestTemplateReload() {
  */
 async function chooseRecords() {
   if (busy.value) {
-    status.value = "正在处理中，请稍候再选择记录";
+    status.value = "正在处理，完成后可选择记录";
     return;
   }
   if (shouldGuardUnsavedNavigation(refreshTemplateDirtyState())) {
@@ -1660,12 +1643,11 @@ async function chooseRecords() {
   } catch (cause) {
     busy.value = false;
     error.value = cause instanceof Error ? cause.message : "选择记录失败";
-    status.value = "选择记录未完成";
+    status.value = "记录选择未完成，批量打印保持不变";
     return;
   }
   if (!ids.length) {
     busy.value = false;
-    status.value = isBatchMode.value ? "未更改打印记录，原批次已保留" : "未选择记录，保持原状态";
     return;
   }
   if (ids.length === 1) {
@@ -1689,8 +1671,6 @@ async function chooseRecords() {
     await loadRecords(false);
     if (printJob.value && templateLoaded.value && selectedTemplateId.value) {
       await loadBatchCandidate(undefined, ids);
-    } else {
-      status.value = "已加载首条记录；模板就绪后请重新选择批量记录";
     }
   })();
 }
@@ -1830,11 +1810,10 @@ async function printOutput() {
     }
     await printRenderedPages(rendered!);
     await assertCurrentContext(active, revision);
-    status.value = "已发起浏览器打印流程，请在打印对话框确认或取消";
   } catch (cause) {
     if (revision === contextRevision) {
       error.value = cause instanceof Error ? cause.message : "浏览器打印失败";
-      status.value = "打印流程未完成";
+      status.value = "未能打开打印窗口，请重试";
     }
   } finally {
     busy.value = false;
@@ -1861,21 +1840,21 @@ async function exportPdf() {
     const paper = result.pageSizes?.length === result.pages
       ? result.pageSizes.every((page) => page.width === result.pageSizes![0].width
         && page.height === result.pageSizes![0].height)
-        ? `；纸张 ${result.pageSizes[0].width.toFixed(1)}×${result.pageSizes[0].height.toFixed(1)} pt`
-        : "；纸张尺寸多种"
+        ? `，纸张 ${result.pageSizes[0].width.toFixed(1)}×${result.pageSizes[0].height.toFixed(1)} pt`
+        : "，纸张尺寸多种"
       : "";
-    status.value = `PDF 已生成：${result.pages} 页，${size}${paper}；已提交浏览器下载`;
+    status.value = `PDF 已生成（${result.pages} 页，${size}${paper}），开始下载`;
   } catch (cause) {
     if (revision === contextRevision) {
       error.value = cause instanceof Error ? cause.message : "PDF 导出失败";
-      status.value = "PDF 导出未完成";
+      status.value = "PDF 导出失败，请重试";
     }
   } finally {
     busy.value = false;
   }
 }
 
-const readOnlyToast = "多维表格有编辑权限，才能编辑模板";
+const readOnlyToast = "没有编辑权限，无法修改模板或打印";
 let firstLoadDone = false;
 let readOnlyToastPending = false;
 
@@ -1930,7 +1909,7 @@ onMounted(() => {
         : null;
       pendingLoadRequest.value = null;
       decisionDialog.value = "context";
-      status.value = "当前记录已切换，请先处理未保存的模板修改";
+      status.value = "已切换记录，请先保存或放弃当前修改";
       return;
     }
     invalidateContext();
@@ -2116,7 +2095,7 @@ onBeforeUnmount(() => {
             <p class="source-panel-hint">点击字段复制，粘贴到编辑区域</p>
           </div>
           <div v-if="activeEditorPanel === 'components'" class="sidebar-section editor-content">
-            <p class="component-hint">拖动组件到右侧画布；选中画布中的组件后，可在右侧属性面板进行设置。</p>
+            <p class="component-hint">拖动组件到画布；选中组件后在右侧属性面板设置。</p>
             <section v-for="group in DESIGNER_COMPONENT_GROUPS" :key="group.id" class="component-group">
               <strong class="editor-group-title">{{ group.label }}</strong>
               <button v-for="component in group.items" :key="component.type"
@@ -2210,7 +2189,6 @@ onBeforeUnmount(() => {
               <span v-if="!hasSelectedRecord">请先点击「选择记录」勾选需要打印的记录</span>
               <span v-else-if="previewError">{{ previewError }}</span>
               <span v-else-if="!templateLoaded">读取当前记录与模板中</span>
-              <span v-else>切回此标签页后，预览会继续生成</span>
               <button v-if="previewError && hasSelectedRecord" class="button button-outline" :disabled="busy" @click="previewOutput">重试预览</button>
             </div>
           </section>

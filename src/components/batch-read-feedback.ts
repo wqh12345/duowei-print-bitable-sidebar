@@ -1,15 +1,16 @@
 import { BitableReadTimeoutError } from "../host/read-timeout.ts";
 
 export type BatchReadFailureFeedback = {
-  status: "未更改打印记录";
+  /** 取消/失败不再占用主句；错误详情与重试入口已足够（Copy-v1 C1） */
+  status: "";
   error: string;
   retryAvailable: boolean;
 };
 
 export function getBatchReadFailureFeedback(cause: unknown): BatchReadFailureFeedback {
   return {
-    status: "未更改打印记录",
-    error: cause instanceof Error ? cause.message : "批量选择失败；原打印任务已保留",
+    status: "",
+    error: cause instanceof Error ? cause.message : "批量读取失败，原批量打印保持不变",
     retryAvailable: cause instanceof BitableReadTimeoutError,
   };
 }

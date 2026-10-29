@@ -49,8 +49,8 @@ export function contextDecisionCancelStatus(
   request: "current" | "batch" | "exit" | "records" | null,
 ): string {
   return request === null
-    ? "已保留当前模板草稿；宿主记录已切换，完成编辑后请重新读取"
-    : "已保留当前模板草稿";
+    ? "模板有未保存的修改；请先处理，再读取新记录"
+    : "未保存的修改已保留";
 }
 
 /**

@@ -78,7 +78,7 @@ test("CT-PERMISSION-02: a read-only base disables output and the record picker w
 
   assert.equal(state.outputDisabled, true);
   assert.equal(state.recordPickerDisabled, true);
-  assert.equal(state.outputBlockReason.includes("阅读权限"), true);
+  assert.equal(state.outputBlockReason, "没有编辑权限，无法修改模板或打印");
   assert.deepEqual(state.recordIds, ["0001", "0002", "0003"]);
   assert.deepEqual(state.summaries.map((item) => item.label), ["PO-0001", "PO-0002", "PO-0003"]);
 });

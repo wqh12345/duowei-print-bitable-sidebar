@@ -13,6 +13,19 @@ import { TEMPLATE_CREATION_OPTIONS } from "../src/components/template-creation-c
 test("CT-TPL-06: template creation choices are blank and automatic only", () => {
   assert.deepEqual(TEMPLATE_CREATION_OPTIONS.map((option) => option.kind), ["blank", "automatic"]);
   assert.deepEqual(TEMPLATE_CREATION_OPTIONS.map((option) => option.label), ["空白模板", "自动生成模板"]);
+  assert.deepEqual(TEMPLATE_CREATION_OPTIONS.map((option) => option.description), [
+    "从空白纸张开始排版",
+    "按当前表字段自动生成排版",
+  ]);
+});
+
+test("CT-TPL-06: batch layout tooltips use user-facing wording", () => {
+  assert.deepEqual(BATCH_LAYOUT_OPTIONS.map((option) => option.kind), ["default", "continuous", "labels"]);
+  assert.deepEqual(BATCH_LAYOUT_OPTIONS.map((option) => option.description), [
+    "每条记录独立一页",
+    "多条记录连排成一张长纸",
+    "按行列与间距铺成标签页",
+  ]);
 });
 
 test("UT-BATCH-LAYOUT-01: legacy structures infer their batch layout without mutation", () => {
