@@ -3,7 +3,6 @@ automation-service/dist/
 automation-service/.tmp/
 .codex-tmp/
 record-view/dist/
-
 # Local configuration and credentials
 .env
 .env.*
