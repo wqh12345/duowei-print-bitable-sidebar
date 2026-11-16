@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import test from "node:test";
 import {
   bindBatchEditProjection,
@@ -41,6 +42,9 @@ import {
   fieldDataSourceId,
   SYSTEM_PRINT_DATE_ID,
 } from "../src/core/data-sources.ts";
+
+const requireScript = createRequire(import.meta.url);
+const designerTableLoader = requireScript("../scripts/designer-table-loader.cjs") as (source: string) => string;
 
 test("SPEC-TPL-01: binding feeds real values to editor preview and print variables", async () => {
   const calls: string[] = [];
@@ -238,6 +242,42 @@ test("CT-DES-06: locked engine contract exposes textarea edit and blur commit bu
   assert.match(bundle, /onBlur: commitInlineEdit/);
   assert.match(bundle, /editingValue\.value = props\.element\.content \|\| ""/);
   assert.doesNotMatch(types, /onTextEdit|setTextContent|updateElement/);
+});
+
+test("B-TABLE-EDIT-01: build-time adapter unwraps the array cell-editor ref before focus/select", () => {
+  const bundle = readFileSync("node_modules/vue-print-designer/dist/web-component-zZPzxxzQ.js", "utf8");
+  // 1.7.39 把表格单元格编辑框渲染在 v-for 内，ref 因此是数组；原始产物仍按单值调用，
+  // 双击单元格即抛 "focus is not a function"（dev 环境表现为 webpack 运行时错误浮层）。
+  assert.match(bundle, /\(_b = inlineEditorRef\.value\) == null \? void 0 : _b\.focus\(\);/);
+  const patched = designerTableLoader(bundle);
+  assert.match(patched, /_b = Array\.isArray\(inlineEditorRef\.value\)/);
+  assert.match(patched, /_c = Array\.isArray\(inlineEditorRef\.value\)/);
+  assert.doesNotMatch(patched, /\(_b = inlineEditorRef\.value\) == null/);
+  assert.doesNotMatch(patched, /\(_c = inlineEditorRef\.value\) == null/);
+});
+
+test("B-TABLE-EDIT-02: build-time adapter lets the host claim the canvas paste menu", () => {
+  const bundle = readFileSync("node_modules/vue-print-designer/dist/web-component-zZPzxxzQ.js", "utf8");
+  // 引擎菜单的置灰只看内部元素剪贴板，点击只克隆元素；数据源字段因此永远粘不上。
+  assert.match(bundle, /disabled: unref\(store\)\.clipboard\.length === 0,\n/);
+  const patched = designerTableLoader(bundle);
+  assert.match(patched, /__duoweiPasteDataSourceReady\(\)/);
+  assert.match(patched, /if \(globalThis\.__duoweiPasteDataSource && globalThis\.__duoweiPasteDataSource\(\)\)/);
+  assert.doesNotMatch(patched, /disabled: unref\(store\)\.clipboard\.length === 0,\n/);
+});
+
+test("B-TABLE-EDIT-03: build-time adapter turns a stitched-image load failure into a readable error", () => {
+  const bundle = readFileSync("node_modules/vue-print-designer/dist/web-component-zZPzxxzQ.js", "utf8");
+  // 引擎用 `img.onerror = reject` 把裸 DOM Event 当拒绝原因：reason 没有 stack，
+  // dev 浮层只能显示 "[object Event]"，且整批导出直接中断。
+  assert.match(bundle, /      img\.onerror = reject;\n      img\.src = images\[0\];/);
+  assert.match(bundle, /        img\.onerror = reject;\n        img\.src = images\[i\];/);
+  const patched = designerTableLoader(bundle);
+  // 首页失败：抛带 URL 的 Error（可读、可定位）；后续页失败：填白留页并继续拼剩余页。
+  assert.match(patched, /img\.onerror = \(event\) => reject\(new Error\("\[duowei\] print page image failed to load: "/);
+  assert.match(patched, /ctx\.fillStyle = "#ffffff";/);
+  assert.match(patched, /ctx\.fillRect\(0, i \* imgHeight, imgWidth, imgHeight\);/);
+  assert.doesNotMatch(patched, /img\.onerror = reject;/);
 });
 
 test("CT-DES-06: blur synchronization resolves added friendly fields and preserves stable save data", async () => {
@@ -1534,6 +1574,18 @@ test("SPEC-UX-03/07/13: locked designer chrome keeps one component/save surface 
     assert.match(appended[0].textContent, /button\[title="导出 PDF"\]/);
     assert.match(appended[0].textContent, /button\[title\^="打印预览"\]/);
     assert.match(appended[0].textContent, /button\[title\^="主题:"\]/);
+    assert.match(appended[0].textContent, /button\[title="设置"\]/);
+    // 纸张尺寸下拉仅保留 A3/A4/A5/自定义：7 个非 A 系列预设 option 必须被注入样式隐藏。
+    assert.match(bundle, /renderList\(unref\(PAPER_SIZES\)/);
+    assert.match(bundle, /"Receipt 58mm"/);
+    assert.match(bundle, /"241-3 \(Third\)"/);
+    assert.match(appended[0].textContent, /select option\[value="LETTER"\]/);
+    assert.match(appended[0].textContent, /select option\[value="LEGAL"\]/);
+    assert.match(appended[0].textContent, /select option\[value="Receipt 58mm"\]/);
+    assert.match(appended[0].textContent, /select option\[value="Receipt 80mm"\]/);
+    assert.match(appended[0].textContent, /select option\[value="241-1 \(Full\)"\]/);
+    assert.match(appended[0].textContent, /select option\[value="241-2 \(Half\)"\]/);
+    assert.match(appended[0].textContent, /select option\[value="241-3 \(Third\)"\]/);
     assert.deepEqual(closedPanels, [
       "designer:close-elements-panel",
       "designer:close-structure-panel",

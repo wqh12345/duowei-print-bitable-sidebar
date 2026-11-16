@@ -32,6 +32,8 @@ export type DesignerElement = HTMLElement & {
   setTestData(data: Record<string, unknown>, options?: { merge?: boolean }): Promise<void>;
   setVariables(data: Record<string, unknown>, options?: { merge?: boolean }): Promise<void>;
   setAvailableVariables?(variables: DesignerDataSourceGroup[]): void;
+  getPrintQuality?(): "fast" | "normal" | "high" | "ultra";
+  setPrintQuality?(quality: "fast" | "normal" | "high" | "ultra"): void;
   getTemplateData(): unknown;
   print(request?: { mode?: "browser" | "local" | "remote" }): Promise<unknown>;
   export(request: { type: "pdf" | "pdfBlob"; filename?: string }): Promise<unknown>;
@@ -56,6 +58,44 @@ const RUNTIME_SOURCE_CONTENT = "__duoweiSourceContent";
 const RUNTIME_SOURCE_VARIABLE = "__duoweiSourceVariable";
 const MANAGED_TOKEN_PATTERN = /@__duowei_(?:field|system|print_empty)_[A-Za-z0-9_.-]+/g;
 
+// vue-print-designer@1.7.39 decides the canvas context menu "粘贴" item from its
+// internal element clipboard and only clones elements on click. The build-time
+// adapter (scripts/designer-table-loader.cjs) lets the host claim that click via
+// these two globals when a data-source field is armed and the target is a text
+// box or table cell; every other case falls through to the native element paste.
+const PASTE_BRIDGE_READY = "__duoweiPasteDataSourceReady";
+const PASTE_BRIDGE_RUN = "__duoweiPasteDataSource";
+const DATA_SOURCE_PASTE_TTL = 10 * 60 * 1000;
+
+type DataSourcePasteTarget = {
+  wrapper: HTMLElement;
+  elementId: string;
+  cell: HTMLElement | null;
+};
+
+type DataSourcePasteBridge = {
+  ready: () => boolean;
+  paste: () => boolean;
+};
+
+let activePasteBridge: DataSourcePasteBridge | null = null;
+
+function setPasteBridge(bridge: DataSourcePasteBridge | null) {
+  activePasteBridge = bridge;
+  const scope = globalThis as unknown as Record<string, unknown>;
+  if (!bridge) {
+    delete scope[PASTE_BRIDGE_READY];
+    delete scope[PASTE_BRIDGE_RUN];
+    return;
+  }
+  scope[PASTE_BRIDGE_READY] = () => activePasteBridge?.ready() === true;
+  scope[PASTE_BRIDGE_RUN] = () => activePasteBridge?.paste() === true;
+}
+
+function releasePasteBridge(bridge: DataSourcePasteBridge) {
+  if (activePasteBridge === bridge) setPasteBridge(null);
+}
+
 type DesignerDataSourceState = {
   codec: DataSourceTokenCodec;
   persistentExt: Record<string, unknown>;
@@ -70,6 +110,7 @@ type DesignerDataSourceState = {
     needsSync: boolean;
   };
   clipboard?: DataSourceClipboardPayload;
+  clipboardAt?: number;
   pendingBindings: Map<string, PastedDataSourceBinding[]>;
   synchronizing: boolean;
   onChange?: () => void;
@@ -153,6 +194,15 @@ function throwForBindingIssues(issues: ReturnType<DataSourceTokenCodec["toPersis
   }
 }
 
+const TABLE_DATA_VARIABLES = ["variable", "columnsVariable", "dataVariable"] as const;
+
+function hasBoundTableVariable(element: Record<string, unknown>): boolean {
+  return TABLE_DATA_VARIABLES.some((key) => {
+    const value = element[key];
+    return typeof value === "string" && value.trim().startsWith("@");
+  });
+}
+
 function toPersistentTemplate(
   runtimeTemplate: Record<string, unknown>,
   state: DesignerDataSourceState,
@@ -175,7 +225,8 @@ function toPersistentTemplate(
       });
       const definitions = detailTokensFromTemplate({ ext: state.persistentExt });
       const hasLoop = convertedRows.some((row) => rowDetailSource(row, definitions));
-      if (hasLoop || Array.isArray(element[DETAIL_TEMPLATE_ROWS])) {
+      const hasTemplateRows = Array.isArray(element[DETAIL_TEMPLATE_ROWS]);
+      if (hasLoop || hasTemplateRows) {
         if (element.variable && !Array.isArray(element[DETAIL_TEMPLATE_ROWS])) {
           throw new Error("请在未绑定数据的表格中粘贴明细字段，避免将已有业务数据保存为模板");
         }
@@ -183,6 +234,12 @@ function toPersistentTemplate(
         element.data = [];
         delete element.variable;
         element.autoPaginate = true;
+      } else if (!hasBoundTableVariable(element) && convertedRows.length > 0) {
+        // 未绑定数据源、也没有明细循环的表格是纯静态内容：行本身就属于模板。
+        // template-repository 会把任何 table.data 置空以防记录泄漏，因此这里先把
+        // 行转存为模板行，重载时再由 toRuntimeTemplate 还原，避免保存后表格变空白。
+        element[DETAIL_TEMPLATE_ROWS] = convertedRows;
+        element.data = [];
       }
       return;
     }
@@ -235,7 +292,9 @@ export function rememberCopiedDataSource(
   payload: DataSourceClipboardPayload,
 ) {
   const state = designerDataSourceStates.get(designer);
-  if (state) state.clipboard = payload;
+  if (!state) return;
+  state.clipboard = payload;
+  state.clipboardAt = Date.now();
 }
 
 export async function synchronizeDesignerDataSources(designer: DesignerElement) {
@@ -393,9 +452,172 @@ export function installDataSourceEditingLifecycle(
   root.addEventListener("dblclick", handleTableDoubleClick, { capture: true });
   root.addEventListener("focusout", handleFocusOut);
   root.addEventListener("keydown", handleKeyDown, { capture: true });
+
+  // ---- 右键菜单「粘贴」直连数据源 -------------------------------------------
+  // 引擎的右键菜单只认自己的元素剪贴板，这里在打开菜单时记住右键落点，并让
+  // 构建期补丁通过全局桥接询问"能不能粘数据源"，能则由本宿主完成插入。
+  let contextTarget: DataSourcePasteTarget | null = null;
+  let pasteInFlight = false;
+
+  const handleContextMenu = (event: Event) => {
+    const node = event.composedPath()[0];
+    if (!(node instanceof Element)) {
+      contextTarget = null;
+      return;
+    }
+    const wrapper = node.closest<HTMLElement>(".element-wrapper[data-element-id]");
+    if (!wrapper || !root.contains(wrapper)) {
+      contextTarget = null;
+      return;
+    }
+    contextTarget = {
+      wrapper,
+      elementId: wrapper.getAttribute("data-element-id") ?? "",
+      cell: node.closest<HTMLElement>("td[data-field][data-row-index]"),
+    };
+  };
+
+  const livePasteTarget = () => {
+    const target = contextTarget;
+    return target && target.wrapper.isConnected && root.contains(target.wrapper) ? target : null;
+  };
+
+  const inlineEditorOf = (target: DataSourcePasteTarget) => (target.cell
+    ? target.cell.querySelector<HTMLTextAreaElement>("textarea")
+    : target.wrapper.querySelector<HTMLTextAreaElement>("[data-text-content] textarea"));
+
+  const wrapperSelected = (wrapper: HTMLElement) => Boolean(wrapper.querySelector(".resize-handle, .rotate-handle"));
+
+  const elementLocked = (elementId: string) => {
+    try {
+      const element = templateElements(templateRecord(designer.getTemplateData()))
+        .find((item) => item.id === elementId);
+      return element?.locked === true;
+    } catch {
+      return false;
+    }
+  };
+
+  const readyToPaste = () => {
+    const currentState = designerDataSourceStates.get(designer);
+    if (!currentState?.clipboard || !currentState.clipboardAt) return false;
+    if (Date.now() - currentState.clipboardAt > DATA_SOURCE_PASTE_TTL) return false;
+    const target = livePasteTarget();
+    if (!target || !target.elementId) return false;
+    if (target.wrapper.getAttribute("data-read-only") === "true") return false;
+    if (elementLocked(target.elementId)) return false;
+    return target.cell ? true : Boolean(target.wrapper.querySelector("[data-text-content]"));
+  };
+
+  const nextFrame = () => new Promise<void>((resolve) => {
+    if (typeof requestAnimationFrame === "function") requestAnimationFrame(() => resolve());
+    else setTimeout(resolve, 16);
+  });
+
+  // 引擎只在元素处于选中态时才接受双击进入内联编辑，因此必要时先补一次选择。
+  const selectWrapper = (wrapper: HTMLElement) => {
+    const box = wrapper.getBoundingClientRect();
+    const base = {
+      bubbles: true,
+      composed: true,
+      cancelable: true,
+      clientX: box.left + box.width / 2,
+      clientY: box.top + box.height / 2,
+    };
+    wrapper.dispatchEvent(new MouseEvent("mousedown", { ...base, button: 0, buttons: 1 }));
+    window.dispatchEvent(new MouseEvent("mouseup", { ...base, button: 0, buttons: 0 }));
+  };
+
+  const openInlineEditor = async (target: DataSourcePasteTarget) => {
+    const existing = inlineEditorOf(target);
+    if (existing) return existing;
+    if (!wrapperSelected(target.wrapper)) selectWrapper(target.wrapper);
+    const host = target.cell ?? target.wrapper.querySelector<HTMLElement>("[data-text-content]");
+    if (!host) return null;
+    const box = host.getBoundingClientRect();
+    host.dispatchEvent(new MouseEvent("dblclick", {
+      bubbles: true,
+      composed: true,
+      cancelable: true,
+      button: 0,
+      detail: 2,
+      clientX: box.left + box.width / 2,
+      clientY: box.top + box.height / 2,
+    }));
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      await nextFrame();
+      const editor = inlineEditorOf(target);
+      if (editor) return editor;
+    }
+    return null;
+  };
+
+  const insertAtEnd = (editor: HTMLTextAreaElement, text: string) => {
+    const offset = editor.value.length;
+    editor.focus();
+    editor.setSelectionRange(offset, offset);
+    let inserted = false;
+    try {
+      inserted = typeof document.execCommand === "function"
+        && document.execCommand("insertText", false, text);
+    } catch {
+      inserted = false;
+    }
+    if (inserted) return offset;
+    editor.setRangeText(text, offset, offset, "end");
+    editor.dispatchEvent(typeof InputEvent === "function"
+      ? new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText", data: text })
+      : new Event("input", { bubbles: true, composed: true }));
+    return offset;
+  };
+
+  const pasteDataSource = async (target: DataSourcePasteTarget) => {
+    const currentState = designerDataSourceStates.get(designer);
+    const payload = currentState?.clipboard;
+    if (!currentState || !payload) return;
+    const editor = await openInlineEditor(target);
+    if (!editor) {
+      currentState.onError?.(new Error("无法进入编辑状态，请双击文本框后按 Ctrl+V 粘贴"));
+      return;
+    }
+    const offset = insertAtEnd(editor, payload.text);
+    // 引擎进入编辑态后会再 focus() + select() 一把，可能覆盖刚插入的光标位置。
+    const cursor = offset + payload.text.length;
+    await nextFrame();
+    if (editor.isConnected
+      && (editor.selectionStart !== cursor || editor.selectionEnd !== cursor)) {
+      editor.focus();
+      editor.setSelectionRange(cursor, cursor);
+    }
+    const cellKey = target.cell
+      ? `${target.cell.getAttribute("data-row-index")}:${target.cell.getAttribute("data-field")}`
+      : "";
+    const bindingKey = cellKey ? `${target.elementId}:${cellKey}` : target.elementId;
+    currentState.pendingBindings.set(bindingKey, [
+      ...(currentState.pendingBindings.get(bindingKey) ?? []),
+      { label: payload.label, token: payload.token, offset },
+    ]);
+  };
+
+  const pasteBridge: DataSourcePasteBridge = {
+    ready: readyToPaste,
+    paste: () => {
+      if (pasteInFlight || !readyToPaste()) return false;
+      const target = livePasteTarget();
+      if (!target) return false;
+      pasteInFlight = true;
+      void pasteDataSource(target).finally(() => { pasteInFlight = false; });
+      return true;
+    },
+  };
+  setPasteBridge(pasteBridge);
+  root.addEventListener("contextmenu", handleContextMenu, { capture: true });
+
   return () => {
     root.removeEventListener("paste", handlePaste, { capture: true });
     root.removeEventListener("dblclick", handleTableDoubleClick, { capture: true });
+    root.removeEventListener("contextmenu", handleContextMenu, { capture: true });
+    releasePasteBridge(pasteBridge);
     for (const timer of focusTimers) clearTimeout(timer);
     root.removeEventListener("focusout", handleFocusOut);
     root.removeEventListener("keydown", handleKeyDown, { capture: true });
@@ -617,7 +839,17 @@ export function installDesignerWorkspaceChrome(designer: DesignerElement, target
     button[title^="打印 ("],
     button[title^="选择语言:"],
     button[title^="主题:"],
-    button[title="帮助"] { display: none !important; }
+    button[title="帮助"],
+    button[title="设置"] { display: none !important; }
+    /* 纸张尺寸仅保留 A3/A4/A5 与“自定义”，隐藏信函/票据/针式等非 A 系列预设；页面设置面板 Teleport 到本 shadowRoot 内的 .print-designer-modals，故此处样式可命中其 select 选项。 */
+    select option[value="LETTER"],
+    select option[value="A5"],
+    select option[value="LEGAL"],
+    select option[value="Receipt 58mm"],
+    select option[value="Receipt 80mm"],
+    select option[value="241-1 (Full)"],
+    select option[value="241-2 (Half)"],
+    select option[value="241-3 (Third)"] { display: none !important; }
   `;
   root.appendChild(style);
   target.dispatchEvent(new Event("designer:close-elements-panel"));
@@ -1247,6 +1479,10 @@ export async function getPrintJobPdfBlob(
   filename = "duowei-print.pdf",
 ): Promise<Blob> {
   requireDocuments(job);
+  // vue-print-designer 的 PDF 走位图化管线（DOM→canvas→JPEG），默认打印质量「normal」仅 96 DPI，
+  // 放大后会发糊。导出前统一提升为「ultra」（2× ≈ 192 DPI）；该值仅在 PDF/图片栅格化时生效，
+  // 不影响 HTML 预览与浏览器打印等现有功能。
+  designer.setPrintQuality?.("ultra");
   let blob: Blob | null;
   if (hasDesignerLabelGrid(designer)) {
     blob = await getLabelPrintJobPdfBlob(designer, job);

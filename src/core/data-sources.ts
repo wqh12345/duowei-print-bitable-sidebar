@@ -1,6 +1,12 @@
 import { isDetailLinkField, type NormalizedField, type PrintJob } from "./print-job.ts";
 import { cloneJsonValue } from "./json-clone.ts";
-import { DETAIL_TEMPLATE_ROWS, detailTokensFromTemplate, renderDetailTemplateRows } from "./detail-tables.ts";
+import {
+  DETAIL_TEMPLATE_ROWS,
+  detailTokensFromTemplate,
+  mapDetailRowText,
+  renderDetailTemplateRows,
+  rowDetailSource,
+} from "./detail-tables.ts";
 import {
   createDataSourceTokenCodec,
   type DataSourceTokenCodec,
@@ -230,12 +236,28 @@ export function prepareTemplateForOutput(
     elements.forEach((element, elementIndex) => {
       if (!element || typeof element !== "object" || Array.isArray(element)) return;
       const item = element as Record<string, unknown>;
-      if (item.type === "table" && Array.isArray(item[DETAIL_TEMPLATE_ROWS]) && codec) {
+      if (item.type === "table" && Array.isArray(item[DETAIL_TEMPLATE_ROWS])) {
+        const rows = item[DETAIL_TEMPLATE_ROWS] as Record<string, any>[];
+        const hasLoop = rows.some((row) => rowDetailSource(row, detailTokens));
+        if (!codec) {
+          // 明细循环必须有 codec 才能展开，保持原有跳过行为；静态行仍可输出，
+          // 只是未识别的 Token 会保持原样。
+          if (hasLoop) return;
+          item.data = mapDetailRowText(rows, (text) => resolveDataSourceTokens(text, values));
+          return;
+        }
         const key = `__duowei_detail_rows_${pageIndex}_${elementIndex}`;
-        outputVariables[key] = renderDetailTemplateRows(item[DETAIL_TEMPLATE_ROWS] as Record<string, any>[], detailTokens, values, codec);
+        const rendered = renderDetailTemplateRows(rows, detailTokens, values, codec);
+        outputVariables[key] = rendered;
         item.variable = `@${key}`;
-        item.data = [];
-        item.autoPaginate = true;
+        if (hasLoop) {
+          item.data = [];
+          item.autoPaginate = true;
+        } else {
+          // 静态模板行：变量只负责按记录替换内容，同时保留行数据兜底，
+          // 并沿用表格原有的分页设置，避免改变静态表格的版式。
+          item.data = rendered;
+        }
         return;
       }
       if (item.type !== "text") return;

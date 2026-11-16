@@ -115,3 +115,111 @@ test("repository saves and reloads detail row definitions while discarding runti
   assert.deepEqual(loaded.pages[0].elements[0].data, []);
   assert.ok(!JSON.stringify(saved).includes("业务数据不可保存"));
 });
+
+function scalarJob(): PrintJob {
+  const fields: NormalizedField[] = [{ id: "f1", name: "客户", type: "1" }];
+  return {
+    source: { baseId: "b", tableId: "t", recordIds: ["a"] },
+    table: { name: "订单", fields },
+    generatedAt: "2026-10-15T00:00:00Z",
+    documents: [{ recordId: "a", values: { 客户: "甲公司" } }],
+  };
+}
+
+function designerStub(): { designer: DesignerElement; current: () => any } {
+  let current: any;
+  const designer = {
+    loadTemplateData(value: unknown) { current = structuredClone(value); return true; },
+    getTemplateData() { return current; },
+    async setTestData() {},
+    async setVariables() {},
+  } as unknown as DesignerElement;
+  return { designer, current: () => current };
+}
+
+function memoryRepository() {
+  const storage = new Map<string, unknown>();
+  return createTemplateRepository({
+    async getData<T>(key: string) { return storage.get(key) as T; },
+    async setData<T>(key: string, value: T) { storage.set(key, structuredClone(value)); return true; },
+  });
+}
+
+test("B-STATIC-TABLE: unbound table rows persist as template rows and survive a reload", async () => {
+  const printJob = scalarJob();
+  const { designer, current } = designerStub();
+  const source = {
+    pages: [{ id: "p1", elements: [{ id: "notes", type: "table",
+      columns: [{ field: "a", header: "项目" }, { field: "b", header: "说明" }],
+      data: [{ a: "合计", b: "含税" }, { a: "客户", b: "@客户" }] }] }],
+    canvasSize: { width: 794, height: 1123 },
+  };
+
+  await bindPrintJob(designer, source, printJob);
+  const saved: any = getPersistentTemplateData(designer);
+  assert.deepEqual(saved.pages[0].elements[0].data, []);
+  assert.deepEqual(saved.pages[0].elements[0].detailTemplateRows,
+    [{ a: "合计", b: "含税" }, { a: "客户", b: "@__duowei_field_f1" }]);
+
+  const repository = memoryRepository();
+  await repository.upsert({ baseId: "b", tableId: "t" }, saved, {
+    id: "static", name: "静态表格", expectedRevision: null,
+  });
+  const reloaded: any = (await repository.load({ baseId: "b", tableId: "t" }))!.template;
+  assert.deepEqual(reloaded.pages[0].elements[0].detailTemplateRows,
+    [{ a: "合计", b: "含税" }, { a: "客户", b: "@__duowei_field_f1" }]);
+  assert.deepEqual(reloaded.pages[0].elements[0].data, []);
+
+  await bindPrintJob(designer, reloaded, printJob);
+  assert.deepEqual(current().pages[0].elements[0].data,
+    [{ a: "合计", b: "含税" }, { a: "客户", b: "@客户" }]);
+
+  const prepared = prepareTemplateForOutput(reloaded, getDocumentVariables(printJob, 0),
+    createPrintJobDataSourceTokenCodec(printJob, reloaded));
+  const outputTable: any = prepared.template.pages[0].elements[0];
+  assert.deepEqual(prepared.variables[outputTable.variable.slice(1)],
+    [{ a: "合计", b: "含税" }, { a: "客户", b: "甲公司" }]);
+});
+
+test("B-STATIC-TABLE: a table bound to a data source variable still discards runtime rows", async () => {
+  const printJob = scalarJob();
+  const { designer } = designerStub();
+  const source = {
+    pages: [{ id: "p1", elements: [{ id: "bound", type: "table", variable: "@__duowei_field_f1",
+      columns: [{ field: "a", header: "项目" }], data: [{ a: "运行时记录值" }] }] }],
+    canvasSize: { width: 794, height: 1123 },
+  };
+
+  await bindPrintJob(designer, source, printJob);
+  const repository = memoryRepository();
+  await repository.upsert({ baseId: "b", tableId: "t" }, getPersistentTemplateData(designer), {
+    id: "bound", name: "绑定表格", expectedRevision: null,
+  });
+  const stored: any = (await repository.load({ baseId: "b", tableId: "t" }))!.template;
+  assert.deepEqual(stored.pages[0].elements[0].data, []);
+  assert.equal(stored.pages[0].elements[0].detailTemplateRows, undefined);
+  assert.ok(!JSON.stringify(stored).includes("运行时记录值"));
+});
+
+test("B-STATIC-TABLE: static template rows render per record without changing pagination", () => {
+  const printJob = scalarJob();
+  const source = {
+    pages: [{ id: "p1", elements: [{ id: "notes", type: "table",
+      columns: [{ field: "a", header: "项目" }, { field: "b", header: "说明" }],
+      data: [], detailTemplateRows: [{ a: "客户", b: "@__duowei_field_f1" }] }] }],
+    canvasSize: { width: 794, height: 1123 },
+    ext: { availableVariables: buildDataSourceCatalog(printJob.table.fields) },
+  };
+  const codec = createPrintJobDataSourceTokenCodec(printJob, source);
+  const firstValues = getDocumentVariables(printJob, 0);
+  const first = prepareTemplateForOutput(source, firstValues, codec);
+  const table: any = first.template.pages[0].elements[0];
+  assert.deepEqual(table.data, [{ a: "客户", b: "甲公司" }]);
+  assert.equal(typeof table.variable, "string");
+  assert.deepEqual(first.variables[table.variable.slice(1)], [{ a: "客户", b: "甲公司" }]);
+  assert.equal(table.autoPaginate, undefined);
+
+  const secondValues = { ...firstValues, 客户: "乙公司", __duowei_field_f1: "乙公司" };
+  const second = prepareTemplateForOutput(source, secondValues, codec);
+  assert.deepEqual(second.variables[table.variable.slice(1)], [{ a: "客户", b: "乙公司" }]);
+});

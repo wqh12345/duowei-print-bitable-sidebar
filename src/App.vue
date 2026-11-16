@@ -1006,9 +1006,29 @@ async function saveTemplate(options: { returnToPreview?: boolean; allowContextCh
     templateFallback.value = false;
     templateDirty.value = false;
     templateCreateError.value = "";
+    let canvasRebindFailed = false;
+    if (!batchEditing && printJob.value && designerRef.value) {
+      // 保存会把画布规范化（表格行转存为模板行、清掉运行时记录值）。用落库结果
+      // 重建一次画布，让"保存后看到的"与"重新打开看到的"保持一致，避免模板内容
+      // 实际已丢失却要等到下次重载才暴露。
+      try {
+        const rebound = ensureBatchLayout(
+          saved.template,
+          getBatchLayoutMode(saved.template),
+          () => generateLabelTemplate(printJob.value!),
+          () => generateTemplate(printJob.value!),
+        ).effectiveTemplate;
+        await bindPrintJob(designerRef.value, rebound, printJob.value);
+      } catch (cause) {
+        canvasRebindFailed = true;
+        const detail = cause instanceof Error ? cause.message : "编辑画布未能重新加载";
+        templateWarning.value = `模板已保存，但编辑画布未与存储同步：${detail}`;
+      }
+    }
     // The editor can keep a bound runtime projection after persistence. Compare
     // future edits with that same live projection, not the stored canonical data.
-    captureTemplateBaseline();
+    // 画布重建失败时以落库模板为基线，让画布差异显示为未保存修改。
+    captureTemplateBaseline(canvasRebindFailed ? saved.template : undefined);
     status.value = "模板已保存";
     if (batchEditing && renderFailure) {
       batchPreviewStale.value = true;
@@ -1782,7 +1802,9 @@ async function copyDataSource(source: { id: string; label: string }) {
     copiedSourceId.value = source.id;
     window.setTimeout(() => { if (copiedSourceId.value === source.id) copiedSourceId.value = ""; }, 1800);
     if (designerRef.value) rememberCopiedDataSource(designerRef.value, payload);
-    status.value = source.id.includes(".__duowei_column_") ? `已复制“${source.label}”，请双击表格数据行的单元格后粘贴` : `已复制“${source.label}”，请选中文本组件后粘贴`;
+    status.value = source.id.includes(".__duowei_column_")
+      ? `已复制“${source.label}”，右键表格单元格选择“粘贴”即可`
+      : `已复制“${source.label}”，右键文本组件选择“粘贴”即可`;
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : "数据源复制失败";
     status.value = "数据源复制失败";
@@ -1871,6 +1893,33 @@ function flushReadOnlyToast() {
   }, 2600);
 }
 
+/**
+ * 引擎 stitchImages 把 `img.onerror` 的事件对象直接当作 Promise 拒绝原因抛出，这类 reason 是
+ * DOM Event、没有 stack：dev 下会被 webpack-dev-server 当成未知异常弹全屏浮层，生产下则是一条
+ * 无人处理的 unhandledrejection（导出静默失败）。这里在捕获阶段兜住「资源加载失败」这一类，
+ * 阻止浮层与浏览器默认报错并翻译成可读提示；普通 Error 异常不拦截，仍按原样暴露。
+ */
+const STITCHED_IMAGE_ERROR_PREFIX = "[duowei] print page image failed to load";
+function rejectedResourceSource(reason: unknown): string | null {
+  if (reason instanceof Event && reason.type === "error") {
+    const target = reason.target;
+    return target instanceof HTMLImageElement ? target.currentSrc || target.src : "";
+  }
+  if (reason instanceof Error && reason.message.startsWith(STITCHED_IMAGE_ERROR_PREFIX)) {
+    return reason.message.slice(STITCHED_IMAGE_ERROR_PREFIX.length).replace(/^:\s*/, "");
+  }
+  return null;
+}
+
+function handleUnhandledResourceRejection(event: PromiseRejectionEvent) {
+  const source = rejectedResourceSource(event.reason);
+  if (source === null) return;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  console.warn("[多维打印] 图片资源加载失败，相关区域按空白输出：", source || "unknown");
+  status.value = "图片未能加载，相关区域按空白输出";
+}
+
 /** 探测编辑权限；只读时由 writeActionsDisabled 与 batch-workspace-action-state 统一置灰，并提示一次 */
 async function refreshEditPermission() {
   const editable = await canEditCurrentBase();
@@ -1881,6 +1930,7 @@ async function refreshEditPermission() {
 
 onMounted(() => {
   window.addEventListener("duowei-print:designer-load-error", handleDesignerLoadError);
+  window.addEventListener("unhandledrejection", handleUnhandledResourceRejection, true);
   document.addEventListener("pointerdown", handleGlobalPointerDown);
   document.addEventListener("keydown", handleGlobalKeydown);
     document.addEventListener("click", handleDocumentCapture, true);
@@ -1927,6 +1977,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   window.removeEventListener("duowei-print:designer-load-error", handleDesignerLoadError);
+  window.removeEventListener("unhandledrejection", handleUnhandledResourceRejection, true);
   document.removeEventListener("pointerdown", handleGlobalPointerDown);
   document.removeEventListener("keydown", handleGlobalKeydown);
   document.removeEventListener("click", handleDocumentCapture, true);
@@ -2138,7 +2189,7 @@ onBeforeUnmount(() => {
               {{ recordPickerLabel }}
             </button>
             <div v-if="isBatchMode" class="batch-layout-switch" role="group" aria-label="批量排版">
-              <span>批量排版</span>
+              <!-- <span>批量排版</span> -->
               <button v-for="option in BATCH_LAYOUT_OPTIONS" :key="option.kind" type="button"
                 class="batch-layout-button" :class="{ 'batch-layout-button-active': option.kind === currentBatchLayout }"
                 :disabled="writeActionsDisabled || option.kind === currentBatchLayout || !storedTemplate || selectedTemplateId === 'automatic'"
