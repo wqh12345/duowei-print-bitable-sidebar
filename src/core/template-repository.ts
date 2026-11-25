@@ -1,6 +1,9 @@
+// 写入进度回调：批量存储分批提交时上报（done / total 均为批数）。可选，缺省不影响行为。
+export type StorageWriteProgress = (done: number, total: number) => void;
+
 export type TemplateStorage = {
   getData<T = unknown>(key: string): Promise<T | null | undefined>;
-  setData<T = unknown>(key: string, data: T): Promise<boolean>;
+  setData<T = unknown>(key: string, data: T, onProgress?: StorageWriteProgress): Promise<boolean>;
 };
 
 export type StoredTemplate = {
@@ -26,6 +29,7 @@ export type TemplateRepository = {
   list(context: TemplateContext): Promise<TemplateCollection>;
   upsert(context: TemplateContext, template: unknown, options: {
     id: string; name: string; expectedRevision: string | null; savedBatchRecordIds?: string[];
+    onProgress?: StorageWriteProgress;
   }): Promise<TemplateCollection>;
   setBatchRecords(context: TemplateContext, id: string, recordIds: string[], expectedRevision: string | null): Promise<TemplateCollection>;
   rename(context: TemplateContext, id: string, name: string, expectedRevision: string | null): Promise<TemplateCollection>;
@@ -306,7 +310,8 @@ export function createTemplateRepository(
   };
 
   const mutate = async (context: TemplateContext, expectedRevision: string | null,
-    change: (collection: TemplateCollection) => void): Promise<TemplateCollection> => {
+    change: (collection: TemplateCollection) => void,
+    onProgress?: StorageWriteProgress): Promise<TemplateCollection> => {
     const collection = await readCollection(context);
     if (collection.revision !== expectedRevision) {
       throw new Error("模板集合已被其他窗口更新，请重新加载后再保存");
@@ -318,7 +323,7 @@ export function createTemplateRepository(
       baseId: context.baseId, tableId: context.tableId,
       templates: collection.templates, defaultId: collection.defaultId, revision,
     };
-    const persisted = await storage.setData(templateCollectionKey(context.baseId, context.tableId), envelope);
+    const persisted = await storage.setData(templateCollectionKey(context.baseId, context.tableId), envelope, onProgress);
     if (!persisted) throw new Error("活动模板保存失败，飞书存储未确认写入");
     return cloneJsonValue({ templates: collection.templates, defaultId: collection.defaultId, revision });
   };
@@ -352,7 +357,7 @@ export function createTemplateRepository(
         if (index < 0) collection.templates.push(item);
         else collection.templates[index] = item;
         collection.defaultId ??= options.id;
-      });
+      }, options.onProgress);
     },
     async setBatchRecords(context, id, recordIds, expectedRevision) {
       if (recordIds.length > 50 || recordIds.some((value) => typeof value !== "string" || !value.trim())

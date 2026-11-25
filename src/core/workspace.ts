@@ -45,12 +45,16 @@ export function shouldGuardUnsavedNavigation(dirty: boolean): boolean {
   return dirty;
 }
 
-export function contextDecisionCancelStatus(
+/**
+ * 取消「记录/上下文切换」决策后要提示的文案 code。
+ * 返回 code 而不是中文字面量，避免业务逻辑与文案耦合。
+ */
+export type ContextDecisionCancelCode = "warn.template.recordSwitched" | "warn.template.draftKept";
+
+export function contextDecisionCancelStatusCode(
   request: "current" | "batch" | "exit" | "records" | null,
-): string {
-  return request === null
-    ? "模板有未保存的修改；请先处理，再读取新记录"
-    : "未保存的修改已保留";
+): ContextDecisionCancelCode {
+  return request === null ? "warn.template.recordSwitched" : "warn.template.draftKept";
 }
 
 /**

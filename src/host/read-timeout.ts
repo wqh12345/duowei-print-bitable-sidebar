@@ -1,9 +1,16 @@
 export const DEFAULT_READ_TIMEOUT_MS = 15_000;
 
 export class BitableReadTimeoutError extends Error {
+  /** 触发超时的内部操作名，只用于诊断，不上屏 */
+  readonly operation: string;
+  readonly timeoutMs: number;
+
   constructor(operation: string, timeoutMs: number) {
-    super(`读取多维表格数据超时：${operation}（${timeoutMs}ms）；请重试，原打印任务已保留`);
+    // 超时时长与内部操作名对用户没有意义，用「发生了什么 + 影响 + 下一步」替代
+    super("读取数据超时，原来的打印内容已保留；请重试");
     this.name = "BitableReadTimeoutError";
+    this.operation = operation;
+    this.timeoutMs = timeoutMs;
   }
 }
 

@@ -96,7 +96,7 @@ test("CT-UX-10: canvas-first sidebar stays compact without shrinking the editor 
 test("CT-UX-09: App exposes one edit action and one save action per active surface", () => {
   const source = readFileSync("src/App.vue", "utf8");
   const editActions = source.match(/>编辑模板<\/button>/g) ?? [];
-  const saveActions = source.match(/@click="saveTemplate\(\)">保存模板<\/button>/g) ?? [];
+  const saveActions = source.match(/@click="saveTemplate\(\)"><span v-if="savingTemplate"/g) ?? [];
   const backActions = source.match(/返回\{\{ isBatchMode \? "批量预览" : "预览" \}\}/g) ?? [];
 
   assert.equal(editActions.length, 1);
@@ -105,7 +105,7 @@ test("CT-UX-09: App exposes one edit action and one save action per active surfa
   const appHeader = source.match(/<header class="app-header">[\s\S]*?<\/header>/)?.[0] ?? "";
   assert.match(appHeader, /多维打印/);
   assert.doesNotMatch(appHeader, /requestLoadRecords\(true\)/);
-  assert.match(source, /class="workspace-actions"[\s\S]*?presentation\.showBack[\s\S]*?保存模板<\/button>[\s\S]*?<\/div>/);
+  assert.match(source, /class="workspace-actions"[\s\S]*?presentation\.showBack[\s\S]*?savingTemplate \? '保存中…' : '保存模板'[\s\S]*?<\/div>/);
 });
 
 test("CT-UX-05/09: template switching remains behind the unsaved-draft guard", () => {
@@ -194,7 +194,9 @@ test("CT-BATCH-09-EDIT: App replaces the example switcher with one full-batch ed
   assert.doesNotMatch(source, /recordTemplate|记录级模板/);
   assert.match(source, /async function enterEditMode\([\s\S]*?bindBatchEditProjection/);
   assert.match(source, /async function createTemplate\([\s\S]*?bindBatchEditProjection/);
-  assert.match(source, /if \(batchEditing\) await flushBatchProjectionSync\(\)/);
+  // 保存快照时仍调和投影，但不会在可见画布上重载全部记录。
+  assert.match(source, /if \(batchEditing\) \{[\s\S]*?clearTimeout\(batchProjectionSyncTimer\)/);
+  assert.match(source, /const editedTemplate = restoreImplicitSelectionLayering\(\s*getPersistentTemplateData\(designerRef\.value\)/);
 });
 
 test("SPEC-UX-13/14/CT-TPL-06: components remain editable while batch layouts stop creating templates", () => {

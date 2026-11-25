@@ -843,7 +843,6 @@ export function installDesignerWorkspaceChrome(designer: DesignerElement, target
     button[title="设置"] { display: none !important; }
     /* 纸张尺寸仅保留 A3/A4/A5 与“自定义”，隐藏信函/票据/针式等非 A 系列预设；页面设置面板 Teleport 到本 shadowRoot 内的 .print-designer-modals，故此处样式可命中其 select 选项。 */
     select option[value="LETTER"],
-    select option[value="A5"],
     select option[value="LEGAL"],
     select option[value="Receipt 58mm"],
     select option[value="Receipt 80mm"],

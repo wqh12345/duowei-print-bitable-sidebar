@@ -4,6 +4,15 @@ import { bitable } from "@lark-base-open/js-sdk";
 import { BitableReadTimeoutError, loadPrintJob } from "../src/host/bitable-gateway.ts";
 import type { PrintJob } from "../src/core/print-job.ts";
 
+/**
+ * 超时的内部操作名只用于诊断，不再写进上屏文案；
+ * 因此用 `operation` 断言，既保住可诊断性，也不把技术细节绑进气泡。
+ */
+function isReadTimeout(operation: string) {
+  return (error: unknown): boolean =>
+    error instanceof BitableReadTimeoutError && error.operation === operation;
+}
+
 function legacyDetailRows(job: PrintJob) {
   const columns = job.table.fields.find((field) => field.id === "lines")!.arrayColumns!;
   return (job.documents[0].values.明细 as Array<Record<string, unknown>>)
@@ -369,8 +378,7 @@ test("SPEC-LINK-03: a linked-record timeout remains retryable", async () => {
         ["order-1"],
         { timeoutMs: 10 },
       ),
-      (error: unknown) => error instanceof BitableReadTimeoutError
-        && /读取关联记录/.test(error.message),
+      isReadTimeout("读取关联记录"),
     );
   } finally {
     bitable.base.getTable = originalGetTable;
@@ -613,7 +621,7 @@ test("UT-BATCH-08: a hanging record read fails within the configured timeout", a
         ["order-1"],
         { timeoutMs: 10 },
       ),
-      { message: /读取多维表格数据超时：读取记录/ },
+      isReadTimeout("读取记录"),
     );
   } finally {
     bitable.base.getTable = originalGetTable;
@@ -638,7 +646,7 @@ test("UT-BATCH-08: a hanging field read fails instead of being treated as an unr
         ["order-1"],
         { timeoutMs: 10 },
       ),
-      { message: /读取多维表格数据超时：读取字段“订单编号”/ },
+      isReadTimeout("读取字段“订单编号”"),
     );
   } finally {
     bitable.base.getTable = originalGetTable;
@@ -669,7 +677,7 @@ test("UT-BATCH-09: a timed-out read does not prevent a successful retry", async 
     const selection = { baseId: "base-test", tableId: "table-orders", viewId: "view-orders" };
     await assert.rejects(
       () => loadPrintJob(selection, ["order-1"], { timeoutMs: 50 }),
-      { message: /读取多维表格数据超时：读取记录/ },
+      isReadTimeout("读取记录"),
     );
     const retried = await loadPrintJob(selection, ["order-2"], { timeoutMs: 50 });
     assert.equal(reads, 2);

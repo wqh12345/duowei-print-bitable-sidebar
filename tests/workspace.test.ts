@@ -7,7 +7,7 @@ import {
   getWorkspaceSurface,
   initialWorkspaceMode,
   canEnterTemplateEdit,
-  contextDecisionCancelStatus,
+  contextDecisionCancelStatusCode,
   modeAfterDiscardForLoadRequest,
   shouldIgnorePendingSelectionChange,
   shouldGuardUnsavedNavigation,
@@ -71,9 +71,11 @@ test("SPEC-UX-05/SPEC-SAVE-03: a new unsaved template stays dirty even with iden
 });
 
 test("SPEC-BATCH-08: continuing an explicit batch request must not claim the host switched", () => {
-  assert.equal(contextDecisionCancelStatus("batch"), "未保存的修改已保留");
-  assert.equal(contextDecisionCancelStatus("current"), "未保存的修改已保留");
-  assert.match(contextDecisionCancelStatus(null), /请先处理，再读取新记录/);
+  // 断言 code 而不是中文字面量：文案调整不应破坏语义判断
+  assert.equal(contextDecisionCancelStatusCode("batch"), "warn.template.draftKept");
+  assert.equal(contextDecisionCancelStatusCode("current"), "warn.template.draftKept");
+  assert.equal(contextDecisionCancelStatusCode("records"), "warn.template.draftKept");
+  assert.equal(contextDecisionCancelStatusCode(null), "warn.template.recordSwitched");
 });
 
 test("SPEC-BATCH-08: transient selection events do not clear an explicit load request", () => {

@@ -5,6 +5,7 @@ import {
   createSinglePrintSession,
 } from "../src/core/batch-print-session.ts";
 import { getBatchWorkspaceActionState } from "../src/components/batch-workspace-action-state.ts";
+import { feedbackText } from "../src/core/feedback-copy.ts";
 
 function batchSession(recordIds: string[]) {
   const result = commitBatchPrintSession(createSinglePrintSession("host-record"), {
@@ -78,7 +79,7 @@ test("CT-PERMISSION-02: a read-only base disables output and the record picker w
 
   assert.equal(state.outputDisabled, true);
   assert.equal(state.recordPickerDisabled, true);
-  assert.equal(state.outputBlockReason, "没有编辑权限，无法修改模板或打印");
+  assert.equal(state.outputBlockReason, feedbackText("hint.permission.readonly"));
   assert.deepEqual(state.recordIds, ["0001", "0002", "0003"]);
   assert.deepEqual(state.summaries.map((item) => item.label), ["PO-0001", "PO-0002", "PO-0003"]);
 });

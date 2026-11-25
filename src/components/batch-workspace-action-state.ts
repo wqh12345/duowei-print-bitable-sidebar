@@ -1,5 +1,6 @@
 import type { BatchPrintSession, BatchRecordSummary } from "../core/batch-print-session.ts";
 import type { WorkspaceMode } from "../core/workspace.ts";
+import { feedbackText } from "../core/feedback-copy.ts";
 import { shouldShowBatchReadRetry } from "./batch-read-feedback.ts";
 
 export type BatchWorkspaceActionInput = {
@@ -45,7 +46,7 @@ export function getBatchWorkspaceActionState(
     recordIds,
     summaries,
     retryVisible: shouldShowBatchReadRetry(input.retryAvailable, input.busy),
-    // 只读用户改不了「多维打印-模板数据」表（记录选择会写表），
+    // 只读用户改不了「多维打印-模板数据」表（记录选择会写 setBatchRecords），
     // 导出 PDF／打印按产品要求一并禁用。
     outputDisabled: input.busy
       || input.workspaceMode !== "preview"
@@ -53,9 +54,11 @@ export function getBatchWorkspaceActionState(
       || !input.hasRenderedPages
       || !input.canEdit,
     recordPickerDisabled: input.busy || !input.canEdit,
-    outputBlockReason: input.canEdit
-      ? ""
-      : "没有编辑权限，无法修改模板或打印",
+    // 置灰原因按真实原因归因：权限不足 ≠ 正在处理 ≠ 还没就绪。
+    // 只给前两种提示，其余情况留空，避免用错误的原因解释置灰。
+    outputBlockReason: !input.canEdit
+      ? feedbackText("hint.permission.readonly")
+      : input.busy ? feedbackText("hint.busy") : "",
     selectLabel: isBatchMode ? "重新选择" : "选择打印记录",
     printLabel: isBatchMode ? `打印 ${count} 条` : "打印",
     exportPdfLabel: isBatchMode ? `导出 ${count} 条 PDF` : "导出 PDF",

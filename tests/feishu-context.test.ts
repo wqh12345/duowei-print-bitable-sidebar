@@ -7,6 +7,7 @@ import {
   sameContext,
   selectRecordIds,
 } from "../src/host/feishu-context.ts";
+import { BitableReadTimeoutError } from "../src/host/read-timeout.ts";
 
 test("SPEC-CTX-01: a table/view switch invalidates the old print context", () => {
   const current = { baseId: "base-1", tableId: "table-1", viewId: "view-1", recordId: "record-1" };
@@ -38,7 +39,8 @@ test("SPEC-CTX-02: missing host record never falls back to an arbitrary row", ()
 test("UT-BATCH-08: a hanging host selection fails within the configured timeout", async () => {
   await assert.rejects(
     () => getActiveSelection(10, () => new Promise<never>(() => undefined)),
-    { message: /读取多维表格数据超时：获取当前多维表格选择/ },
+    (error: unknown) => error instanceof BitableReadTimeoutError
+      && error.operation === "获取当前多维表格选择",
   );
 });
 
@@ -77,6 +79,7 @@ test("SPEC-CTX-03: an empty table yields no auto record", async () => {
 test("SPEC-CTX-03: a hanging table read fails within the configured timeout", async () => {
   await assert.rejects(
     () => getFirstRecordId("table-1", 10, () => new Promise<never>(() => undefined)),
-    { message: /读取多维表格数据超时：获取数据表/ },
+    (error: unknown) => error instanceof BitableReadTimeoutError
+      && error.operation === "获取数据表",
   );
 });

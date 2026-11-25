@@ -46,6 +46,44 @@ import {
 const requireScript = createRequire(import.meta.url);
 const designerTableLoader = requireScript("../scripts/designer-table-loader.cjs") as (source: string) => string;
 
+// 把补丁后的 setCanvasSize 从产物里抽出来单独执行，验证真实缩放行为，
+// 而不是只断言源码里出现了某段文本。
+function createCanvasResizeStore(
+  patched: string,
+  canvasSize: { width: number; height: number },
+  pages: any[],
+  isTemplateEditable = true,
+) {
+  const start = patched.indexOf("  setCanvasSize(width, height) {");
+  assert.ok(start > 0, "patched setCanvasSize not found");
+  const braceStart = patched.indexOf("{", start);
+  let depth = 0;
+  let method = "";
+  for (let index = braceStart; index < patched.length; index += 1) {
+    if (patched[index] === "{") depth += 1;
+    else if (patched[index] === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        method = patched.slice(start, index + 1);
+        break;
+      }
+    }
+  }
+  assert.ok(method, "patched setCanvasSize body not found");
+  const proto = new Function("HISTORY_ACTION", "return {" + method + "};")(
+    { CANVAS_RESIZE: "canvas-resize" },
+  ) as { setCanvasSize: (width: number, height: number) => void };
+  const store = {
+    isTemplateEditable,
+    canvasSize: { ...canvasSize },
+    pages,
+    snapshots: 0,
+    snapshot() { store.snapshots += 1; },
+    setCanvasSize: proto.setCanvasSize,
+  };
+  return store;
+}
+
 test("SPEC-TPL-01: binding feeds real values to editor preview and print variables", async () => {
   const calls: string[] = [];
   const payloads: Record<string, unknown>[] = [];
@@ -278,6 +316,188 @@ test("B-TABLE-EDIT-03: build-time adapter turns a stitched-image load failure in
   assert.match(patched, /ctx\.fillStyle = "#ffffff";/);
   assert.match(patched, /ctx\.fillRect\(0, i \* imgHeight, imgWidth, imgHeight\);/);
   assert.doesNotMatch(patched, /img\.onerror = reject;/);
+});
+
+test("B-CANVAS-RESIZE-01: build-time adapter scales elements when the paper preset changes", () => {
+  const bundle = readFileSync("node_modules/vue-print-designer/dist/web-component-zZPzxxzQ.js", "utf8");
+  // 1.7.39 的 setCanvasSize 只改 canvasSize：A4 模板切 A5 后元素仍按 794 宽排版，
+  // 双列字段与明细表格右缘落在 744px，直接冲出 559px 画布被裁切。
+  assert.match(
+    bundle,
+    /  setCanvasSize\(width, height\) \{\n    if \(!this\.isTemplateEditable\) return;\n    this\.snapshot\(HISTORY_ACTION\.CANVAS_RESIZE\);\n    this\.canvasSize = \{ width, height \};\n  \},/,
+  );
+  const patched = designerTableLoader(bundle);
+  assert.match(patched, /__duoweiFitCanvasOnResize !== false/);
+  assert.match(patched, /const A_SERIES = \[\[1123, 1587\], \[794, 1123\], \[559, 794\]\];/);
+  assert.match(patched, /const hasLabelGrid = pages\.some/);
+
+  const pages = [{
+    id: "p",
+    elements: [{
+      id: "t", type: "text", x: 48, y: 200, width: 698, height: 34,
+      style: { fontSize: 24, lineHeight: 1.5, rowHeight: 32 },
+      columns: [{ field: "a", width: 698 }],
+    }],
+  }];
+  const store = createCanvasResizeStore(patched, { width: 794, height: 1123 }, pages);
+  const element = pages[0].elements[0];
+
+  store.setCanvasSize(559, 794);
+  assert.equal(store.snapshots, 1, "缩放必须与切纸共用同一份撤销快照");
+  assert.equal(element.x, 33.79);
+  assert.equal(element.width, 491.41);
+  assert.ok(element.x + element.width < 559, "A5 内容右缘必须落在画布内");
+  assert.equal(element.style.fontSize, 16.9);
+  assert.equal(element.style.rowHeight, 22.53);
+  assert.equal(element.columns![0].width, 491.41);
+  assert.equal(element.style.lineHeight, 1.5, "倍率型行高不能当像素缩放");
+
+  store.setCanvasSize(794, 1123);
+  assert.equal(element.x, 48, "往返切回 A4 必须精确还原");
+  assert.equal(element.width, 698);
+  assert.equal(element.style.fontSize, 24);
+  assert.ok(Math.abs(element.y - 200) <= 0.02, "round(2) 带来的往返误差需 <= 0.02px");
+});
+
+test("B-CANVAS-RESIZE-03: table header/footer font and string column widths scale too", () => {
+  const bundle = readFileSync("node_modules/vue-print-designer/dist/web-component-zZPzxxzQ.js", "utf8");
+  const patched = designerTableLoader(bundle);
+  // 表格 style 里还有 headerFontSize / footerFontSize / footerHeight 三个尺寸字段，
+  // 以及列宽可能是字符串数字（拖拽列宽后引擎写回的是字符串）。这些都要一起缩放，
+  // 否则切 A5 后表头大字、表尾行高原地不动，视觉上表格“没有自适应”。
+  const pages = [{
+    id: "p",
+    elements: [{
+      id: "table", type: "table", x: 48, y: 300, width: 698, height: 220,
+      columns: [
+        { field: "a", header: "A", width: 139.6 },
+        { field: "b", header: "B", width: "418.8" },
+        { field: "c", header: "C" },
+      ],
+      style: {
+        fontSize: 14, headerFontSize: 16, footerFontSize: 12,
+        rowHeight: 32, headerHeight: 36, footerHeight: 28,
+        borderWidth: 1, cellPadding: 6,
+      },
+    }],
+  }];
+  const store = createCanvasResizeStore(patched, { width: 794, height: 1123 }, pages);
+  const table = pages[0].elements[0] as any;
+
+  store.setCanvasSize(559, 794);
+  // 字号：表体/表头/表尾等比缩小（k = 559/794 = 0.704030）
+  assert.equal(table.style.fontSize, 9.86);
+  assert.equal(table.style.headerFontSize, 11.26);
+  assert.equal(table.style.footerFontSize, 8.45);
+  // 行高/表头/表尾
+  assert.equal(table.style.rowHeight, 22.53);
+  assert.equal(table.style.headerHeight, 25.35);
+  assert.equal(table.style.footerHeight, 19.71);
+  // 列宽：number 与 string 都缩，且 string 转为 number；无 width 的列不新增字段
+  assert.equal(table.columns[0].width, 98.28);
+  assert.equal(typeof table.columns[0].width, "number");
+  assert.equal(table.columns[1].width, 294.85);
+  assert.equal(typeof table.columns[1].width, "number", "字符串列宽缩放后应为 number");
+  assert.equal(table.columns[2].width, undefined, "无列宽的列不应被新增 width 字段");
+
+  // 往返还原（round(2) 带来 <= 0.02px 误差，肉眼/打印不可见）
+  store.setCanvasSize(794, 1123);
+  assert.ok(Math.abs(table.style.headerFontSize - 16) <= 0.02);
+  assert.ok(Math.abs(table.style.footerHeight - 28) <= 0.02);
+  assert.ok(Math.abs(table.columns[1].width - 418.8) <= 0.02);
+  assert.equal(typeof table.columns[1].width, "number");
+});
+
+test("B-CANVAS-RESIZE-04: tables without explicit font sizes fall back to the engine default before scaling", () => {
+  const bundle = readFileSync("node_modules/vue-print-designer/dist/web-component-zZPzxxzQ.js", "utf8");
+  const patched = designerTableLoader(bundle);
+  // 生成器产出的表格 style 只有 rowHeight/headerHeight，没有 fontSize/headerFontSize/footerFontSize。
+  // 引擎渲染时表体继承画布基线 14px、表头表尾被 class text-sm 固定为 14px，
+  // 所以只缩「已有数值」永远改不到字号。缺省时必须按 14 兜底再乘 k。
+  const pages = [{
+    id: "p",
+    elements: [
+      {
+        id: "table", type: "table", x: 48, y: 300, width: 698, height: 220,
+        columns: [{ field: "a", header: "A" }, { field: "b", header: "B" }],
+        data: [{ a: { text: "x", style: { fontSize: 12, color: "#111827" } }, b: "y" }],
+        style: { rowHeight: 32, headerHeight: 36 },
+      },
+      { id: "text", type: "text", x: 48, y: 40, width: 698, height: 28, style: { color: "#111827" } },
+    ],
+  }];
+  const store = createCanvasResizeStore(patched, { width: 794, height: 1123 }, pages);
+  const table = pages[0].elements[0] as any;
+  const text = pages[0].elements[1] as any;
+
+  store.setCanvasSize(559, 794);
+  // k = 559 / 794 = 0.704030，14 * k = 9.856... -> 9.86
+  assert.equal(table.style.fontSize, 9.86, "表体缺省字号按 14 兜底缩放");
+  assert.equal(table.style.headerFontSize, 9.86, "表头缺省字号按 text-sm 的 14 兜底缩放");
+  assert.equal(table.style.footerFontSize, 9.86, "表尾缺省字号按 text-sm 的 14 兜底缩放");
+  // 单元格级字号优先级高于元素级，必须同步缩放
+  assert.equal(table.data[0].a.style.fontSize, 8.45, "单元格级字号也要缩");
+  assert.equal(table.data[0].a.style.color, "#111827", "单元格其他样式不能被动");
+  assert.equal(table.data[0].b, "y", "普通单元格值保持不变");
+  // 非表格元素维持既有行为，不注入兜底字号
+  assert.equal(text.width, 491.41);
+  assert.equal(text.style.fontSize, undefined, "文本元素不应被注入兜底字号");
+
+  // 往返：9.86 / k ≈ 14.01，round(2) 误差 <= 0.02px
+  store.setCanvasSize(794, 1123);
+  assert.ok(Math.abs(table.style.headerFontSize - 14) <= 0.02, "往返后表头字号回到 14");
+  assert.ok(Math.abs(table.style.fontSize - 14) <= 0.02);
+  assert.ok(Math.abs(table.data[0].a.style.fontSize - 12) <= 0.02);
+});
+
+test("B-IMAGE-COMPRESS-01: image uploads route through the downsampling helper", () => {
+  const bundle = readFileSync("node_modules/vue-print-designer/dist/web-component-zZPzxxzQ.js", "utf8");
+  const patched = designerTableLoader(bundle);
+
+  // 两处上传入口（画布插入 + 属性面板）都被改写为压缩后再提交
+  assert.equal(patched.split("__duoweiCompressImage(result)").length - 1, 2,
+    "工具栏插入与属性面板两处上传都必须走压缩 helper");
+  // 原始直写路径必须被替换掉（catch 降级分支里引用原图是合法保留）
+  assert.ok(!patched.includes("if (result) {\n          store.updateElement(props.element.id, { content: result });"));
+  assert.ok(!patched.includes('if (result) {\n        emit2("update:value", result);'));
+  // helper 注册 IIFE 挂在产物尾部：含逃生开关、最长边 1600、JPEG 0.85 与透明保 PNG
+  assert.ok(patched.includes("globalThis.__duoweiCompressImageUpload === false"));
+  assert.ok(patched.includes("var maxEdge = 1600;"));
+  assert.ok(patched.includes('canvas.toDataURL("image/jpeg", 0.85)'));
+  assert.ok(patched.includes('canvas.toDataURL("image/png")'));
+  // 压缩失败必须降级回原图，不得阻断上传
+  assert.ok(patched.includes("img.onerror = function () { resolve(dataUrl); }"));
+});
+
+test("B-CANVAS-RESIZE-02: label grids, custom sizes and read-only templates keep their geometry", () => {
+  const bundle = readFileSync("node_modules/vue-print-designer/dist/web-component-zZPzxxzQ.js", "utf8");
+  const patched = designerTableLoader(bundle);
+
+  // 标签模板：canvasSize 同样是 A4，但网格尺寸由标签排版决定，不能缩放。
+  const labelPages = [{ id: "p", elements: [{ id: "g", type: "multiLabel", x: 48, y: 48, width: 230, height: 160 }] }];
+  const labelStore = createCanvasResizeStore(patched, { width: 794, height: 1123 }, labelPages);
+  labelStore.setCanvasSize(559, 794);
+  assert.equal((labelPages[0].elements[0] as any).width, 230);
+  assert.deepEqual(labelStore.canvasSize, { width: 559, height: 794 });
+
+  // 连续排版：画布高等于内容高，不是标准纸张，必须跳过。
+  const continuousPages = [{ id: "p", elements: [{ id: "t", type: "text", x: 48, y: 28, width: 698, height: 34 }] }];
+  const continuousStore = createCanvasResizeStore(patched, { width: 794, height: 600 }, continuousPages);
+  continuousStore.setCanvasSize(559, 794);
+  assert.equal((continuousPages[0].elements[0] as any).width, 698);
+
+  // 自定义尺寸：不属于 A 系列预设，保持既有行为。
+  const customPages = [{ id: "p", elements: [{ id: "t", type: "text", x: 48, y: 28, width: 698, height: 34 }] }];
+  const customStore = createCanvasResizeStore(patched, { width: 794, height: 1123 }, customPages);
+  customStore.setCanvasSize(700, 1000);
+  assert.equal((customPages[0].elements[0] as any).width, 698);
+
+  // 只读模板：引擎自身早退，连同纸张都不改。
+  const readonlyPages = [{ id: "p", elements: [{ id: "t", type: "text", x: 48, y: 28, width: 698, height: 34 }] }];
+  const readonlyStore = createCanvasResizeStore(patched, { width: 794, height: 1123 }, readonlyPages, false);
+  readonlyStore.setCanvasSize(559, 794);
+  assert.equal((readonlyPages[0].elements[0] as any).width, 698);
+  assert.deepEqual(readonlyStore.canvasSize, { width: 794, height: 1123 });
 });
 
 test("CT-DES-06: blur synchronization resolves added friendly fields and preserves stable save data", async () => {
@@ -1579,6 +1799,8 @@ test("SPEC-UX-03/07/13: locked designer chrome keeps one component/save surface 
     assert.match(bundle, /renderList\(unref\(PAPER_SIZES\)/);
     assert.match(bundle, /"Receipt 58mm"/);
     assert.match(bundle, /"241-3 \(Third\)"/);
+    // A5 必须保持可选：插件要求 A3/A4/A5 三档纸张都能切，只隐藏非 A 系列。
+    assert.doesNotMatch(appended[0].textContent, /option\[value="A5"\]/);
     assert.match(appended[0].textContent, /select option\[value="LETTER"\]/);
     assert.match(appended[0].textContent, /select option\[value="LEGAL"\]/);
     assert.match(appended[0].textContent, /select option\[value="Receipt 58mm"\]/);

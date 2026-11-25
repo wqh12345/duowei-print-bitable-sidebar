@@ -71,6 +71,15 @@ import {
   getBatchReadFailureFeedback,
 } from "./components/batch-read-feedback.ts";
 import { getBatchWorkspaceActionState } from "./components/batch-workspace-action-state.ts";
+import { composeStatusLine, createFeedbackGate, durationFor } from "./components/status-feedback.ts";
+import {
+  describeError,
+  feedbackText,
+  feedbackTone,
+  sanitizeForUser,
+  type FeedbackCode,
+  type FeedbackTone,
+} from "./core/feedback-copy.ts";
 import { normalizeTemplateName, orderTemplatesWithFirstDefault } from "./components/template-management.ts";
 import {
   DESIGNER_COMPONENT_GROUPS,
@@ -97,7 +106,7 @@ import {
 } from "./core/designer-selection.ts";
 import {
   canEnterTemplateEdit,
-  contextDecisionCancelStatus,
+  contextDecisionCancelStatusCode,
   EDITOR_PANELS,
   getTemplateDirtyState,
   getTemplateStatus,
@@ -112,6 +121,9 @@ import {
 } from "./core/workspace.ts";
 
 const designerRef = ref<DesignerElement | null>(null);
+// 保存后重建画布期间引擎先渲染一帧"裸 @__duowei_render_* 变量"再注入渲染值；
+// 该标志驱动画布遮罩，避免这帧中间态被用户看到。
+const canvasRebinding = ref(false);
 const previewSurfaceRef = ref<HTMLElement | null>(null);
 const previewAvailableWidth = ref(0);
 const selection = ref<FeishuSelection | null>(null);
@@ -150,15 +162,20 @@ const batchSession = ref<BatchPrintSession>(createSinglePrintSession(null));
 const renderedPages = ref<RenderedPrintJob | null>(null);
 const batchPreviewStale = ref(false);
 const status = ref("正在读取当前记录…");
+// 与 status 配对的语气；决定图标、停留时长与是否允许被后续进度覆盖
+const statusTone = ref<FeedbackTone>("progress");
 const error = ref("");
 const busy = ref(false);
+const savingTemplate = ref(false);
+const batchSavePreviewPending = ref(false);
 // 多维表格编辑权限（Base 级）：默认按可编辑放行，探测完成后才置灰，避免 host 抖动把插件锁死
 const canEditBase = ref(true);
 const activeTemplateMenuId = ref<string | null>(null);
 const newTemplateMenuOpen = ref(false);
 const statusToastVisible = ref(false);
-// 只读权限提示走红色感叹号图标（复用 .status-line-error 配色），不写 error 以免污染错误态语义
-const readOnlyNotice = ref(false);
+// 只读权限提示的文案；非空时以信息态上屏，不写 error 以免污染错误态语义
+const readOnlyNotice = ref("");
+const feedbackGate = createFeedbackGate();
 let contextRevision = 0;
 let candidateRender: Promise<RenderedPrintJob> | null = null;
 let statusToastTimer: ReturnType<typeof setTimeout> | undefined;
@@ -178,6 +195,22 @@ let templateManagementReturnFocus: HTMLElement | null = null;
 let explicitLayeringMutation = false;
 const readyPromise = new Promise<void>((resolve) => { resolveDesignerReady = resolve; });
 
+/**
+ * 状态条的唯一写入口。
+ * 警告/错误上屏后会被 gate 锁住，随后的进度文案不会把它顶掉，
+ * 直到用户操作或提示自然收起（见 watch(status)）。
+ */
+function showStatus(text: string, tone: FeedbackTone = "info"): void {
+  if (!text.trim()) return;
+  if (!feedbackGate.accept(tone)) return;
+  statusTone.value = tone;
+  status.value = text;
+}
+
+function showCopy(code: FeedbackCode, params?: Record<string, string | number>): void {
+  showStatus(feedbackText(code, params), feedbackTone(code));
+}
+
 const editorPanelLabels: Record<EditorPanel, string> = {
   "data-sources": "数据源",
   components: "组件",
@@ -186,7 +219,7 @@ const editorPanelLabels: Record<EditorPanel, string> = {
 const templateStatusLabels: Record<TemplateStatus, string> = {
   automatic: "自动模板",
   saved: "已保存",
-  fallback: "只读回退",
+  fallback: "只读副本",
   unsaved: "有未保存修改",
 };
 
@@ -304,14 +337,64 @@ watch(previewSurfaceRef, (surface, _, onCleanup) => {
     observer.disconnect();
   });
 });
-const hasFeedbackError = computed(() => Boolean(error.value || templateWarning.value || previewError.value));
-const showStatusFeedback = computed(() => busy.value
-  || hasFeedbackError.value
-  || showBatchRetry.value
-  || statusToastVisible.value
-  || readOnlyNotice.value);
-// 提示条的红色告警态：真错误，或只读权限提示
-const statusLineError = computed(() => hasFeedbackError.value || readOnlyNotice.value);
+// 气泡内容：主行取结论、次行取原因，tone 决定图标与停留时长
+const statusFeedback = computed(() => composeStatusLine({
+  status: status.value,
+  statusTone: statusTone.value,
+  error: error.value,
+  templateWarning: templateWarning.value,
+  previewError: previewError.value,
+  readOnly: readOnlyNotice.value,
+  busy: busy.value,
+  retryVisible: showBatchRetry.value,
+  toastVisible: statusToastVisible.value,
+}));
+const showStatusFeedback = computed(() => statusFeedback.value.visible);
+const statusLineTone = computed(() => statusFeedback.value.tone);
+// 只有真错误用 role="alert"；权限与警告只是说明，用 role="status"
+const statusLineError = computed(() => statusLineTone.value === "error");
+// 空状态与弹窗的文案统一从 code 表取，模板里不再出现中文字面量
+const emptyPreviewCopy = computed(() => ({
+  title: previewError.value
+    ? feedbackText("empty.preview.failed")
+    : feedbackText("empty.preview.generating"),
+  hint: previewError.value
+    ? ""
+    : templateLoaded.value
+      ? feedbackText("empty.preview.paused")
+      : feedbackText("empty.preview.reading"),
+}));
+const templateManagementCopy = computed(() => {
+  const dialog = templateManagementDialog.value;
+  if (!dialog) return { title: "", body: "" };
+  return dialog.action === "rename"
+    ? { title: feedbackText("dialog.rename.title"), body: feedbackText("dialog.rename.body") }
+    : {
+        title: feedbackText("dialog.remove.title"),
+        body: feedbackText("dialog.remove.body", { name: dialog.item.name }),
+      };
+});
+const decisionCopy = computed(() => {
+  switch (decisionDialog.value) {
+    case "leave":
+      return {
+        title: feedbackText("dialog.unsaved.leave.title"),
+        body: feedbackText("dialog.unsaved.leave.body"),
+      };
+    case "reload":
+      return {
+        title: feedbackText("dialog.unsaved.reload.title"),
+        body: feedbackText("dialog.unsaved.reload.body"),
+      };
+    case "context":
+      return {
+        title: feedbackText("dialog.unsaved.context.title"),
+        body: feedbackText("dialog.unsaved.context.body"),
+      };
+    default:
+      return { title: "", body: "" };
+  }
+});
 const normalizedTemplateRename = computed(() => normalizeTemplateName(templateRenameInput.value));
 const templateManagementConfirmDisabled = computed(() => {
   if (busy.value || !templateManagementDialog.value) return true;
@@ -325,7 +408,9 @@ watch(status, () => {
   if (statusToastTimer) clearTimeout(statusToastTimer);
   statusToastTimer = setTimeout(() => {
     statusToastVisible.value = false;
-  }, 2600);
+    // 提示收起即解锁，避免一次错误永久挡住后续进度
+    feedbackGate.release();
+  }, durationFor(statusTone.value, status.value));
 });
 
 watch(selectedTemplateId, (templateId) => {
@@ -350,6 +435,8 @@ function toggleNewTemplateMenu() {
 }
 
 function handleGlobalPointerDown(event: PointerEvent) {
+  // 用户已经动手，先前上屏的警告/错误可以退场，允许新的提示接替
+  feedbackGate.release();
   const target = event.target;
   if (target instanceof Element && target.closest(".menu-anchor")) return;
   closeTransientMenus();
@@ -406,7 +493,7 @@ function invalidateContext() {
   batchSession.value = createSinglePrintSession(null);
   renderedPages.value = null;
   batchPreviewStale.value = false;
-  status.value = "表格中切换了记录，请点击「选择记录」重新读取";
+  showCopy("status.load.recordSwitched");
 }
 
 async function assertCurrentContext(expected: FeishuSelection, revision: number) {
@@ -467,7 +554,8 @@ async function loadRecords(useBatchPicker = false) {
         selection.value = active;
         await assertCurrentContext(active, revision);
       } else {
-        status.value = "先点击「选择记录」，勾选要打印的记录";
+        // 侧边栏独有的「还没选过记录」入口，语义与主仓的「不是记录视图」不同，单独给拦截语气
+        showStatus("先点击「选择记录」，勾选要打印的记录", "warning");
         return;
       }
     }
@@ -483,8 +571,8 @@ async function loadRecords(useBatchPicker = false) {
     await loadTemplateAndPreview(job, active, revision);
   } catch (cause) {
     if (revision === contextRevision) {
-      error.value = cause instanceof Error ? cause.message : "无法读取表格数据，请稍后重试";
-      status.value = "读取失败，请重试";
+      error.value = sanitizeForUser(cause);
+      showCopy("error.load.failed");
     }
   } finally {
     if (revision === contextRevision) busy.value = false;
@@ -544,7 +632,7 @@ async function loadBatchCandidate(retryRequest?: BatchRetryRequest, preselectedI
         await bindPrintJob(designer, layout.effectiveTemplate, job);
         pending = renderPrintJobCandidate(
           designer, previous, job,
-          (current, total) => { status.value = `正在生成批量预览（${current}/${total}）`; },
+          (current, total) => { showStatus(`正在生成预览 ${current}/${total}`, "progress"); },
           () => revision === contextRevision,
         );
         candidateRender = pending;
@@ -582,7 +670,7 @@ async function loadBatchCandidate(retryRequest?: BatchRetryRequest, preselectedI
     previewError.value = "";
     batchRetryRequest.value = null;
     workspaceMode.value = "preview";
-    status.value = `已为当前模板选择 ${ids.length} 条记录，预览已生成`;
+    showCopy("status.batch.selectionSaved", { count: ids.length });
   } catch (cause) {
     if (revision === contextRevision) {
       if (designer && previous && previousDesignerTemplate) {
@@ -595,10 +683,13 @@ async function loadBatchCandidate(retryRequest?: BatchRetryRequest, preselectedI
       const feedback = getBatchReadFailureFeedback(cause);
       batchRetryAvailable.value = savingSelection || feedback.retryAvailable;
       batchRetryRequest.value = batchRetryAvailable.value ? candidateRequest : null;
-      error.value = savingSelection
-        ? `打印记录未保存：${cause instanceof Error ? cause.message : "飞书存储写入失败"}`
-        : feedback.error;
-      status.value = savingSelection ? "记录未保存，原预览仍可用" : feedback.status;
+      if (savingSelection) {
+        error.value = describeError(cause, "飞书存储写入失败");
+        showCopy("warn.batch.selectionUnsaved");
+      } else {
+        error.value = feedback.error;
+        showStatus(feedback.status, feedback.tone);
+      }
     }
   } finally {
     if (candidateRender === pending) candidateRender = null;
@@ -665,7 +756,7 @@ async function exitBatchMode() {
     batchPreviewStale.value = false;
     previewError.value = "";
     workspaceMode.value = "preview";
-    status.value = "已清除批量记录，回到只打印当前记录";
+    showCopy("status.batch.selectionCleared");
   } catch (cause) {
     if (revision === contextRevision) {
       if (designer && previous && previousDesignerTemplate) {
@@ -675,8 +766,8 @@ async function exitBatchMode() {
           // Keep the committed batch preview as the visible fallback.
         }
       }
-      error.value = cause instanceof Error ? cause.message : "未能回到当前记录，原批量打印仍保留";
-      status.value = "未能回到当前记录";
+      error.value = sanitizeForUser(cause);
+      showCopy("warn.batch.returnFailed");
     }
   } finally {
     if (candidateRender === pending) candidateRender = null;
@@ -750,14 +841,14 @@ async function loadTemplateAndPreview(
     templateDirty.value = false;
     captureTemplateBaseline();
     templateWarning.value = batchRestoreWarning
-      ? `保存的打印记录暂时无法恢复：${batchRestoreWarning}；模板仍可用于当前记录`
+      ? `保存的打印记录暂时读不到：${sanitizeForUser(batchRestoreWarning)}；模板仍可用于当前记录`
       : warning
-      ? `${warning}；原模板未覆盖，已改用自动模板并绑定真实数据`
+      ? `${sanitizeForUser(warning)}；原模板未覆盖，已改用自动模板`
       : "";
     renderedPages.value = null;
     previewHtml.value = "";
     if (warning) {
-      status.value = "已加载当前记录；旧模板暂不可保存";
+      showCopy("warn.template.legacyReadOnly");
     }
     previewHtml.value = "";
     previewError.value = "";
@@ -769,13 +860,14 @@ async function loadTemplateAndPreview(
       batchPreviewStale.value = false;
     } catch (cause) {
       if (revision !== contextRevision) return false;
-      previewError.value = cause instanceof Error ? cause.message : "打印预览生成失败";
+      previewError.value = describeError(cause, "打印预览生成失败");
+      showCopy("status.preview.generateFailed");
     }
     return true;
   } catch (cause) {
     if (revision === contextRevision) {
-      error.value = cause instanceof Error ? cause.message : "无法打开模板，请重试";
-      status.value = "模板读取失败，请重试";
+      error.value = sanitizeForUser(cause);
+      showCopy("error.template.load");
     }
     return false;
   } finally {
@@ -848,18 +940,18 @@ async function flushBatchProjectionSync(): Promise<boolean> {
     return synchronized;
   } catch (cause) {
     const syncError = cause instanceof Error ? cause : new Error("批量模板同步失败");
-    error.value = syncError.message;
-    status.value = "批量打印的模板已变更，请重新编辑后再保存";
+    error.value = sanitizeForUser(syncError);
+    showCopy("warn.batch.conflict");
     throw syncError;
   }
 }
 
 function scheduleBatchProjectionSync() {
-  if (workspaceSurface.value !== "batch-edit") return;
+  if (workspaceSurface.value !== "batch-edit" || savingTemplate.value) return;
   if (batchProjectionSyncTimer) clearTimeout(batchProjectionSyncTimer);
   batchProjectionSyncTimer = setTimeout(() => {
     batchProjectionSyncTimer = undefined;
-    void flushBatchProjectionSync().catch(() => undefined);
+    if (!savingTemplate.value) void flushBatchProjectionSync().catch(() => undefined);
   }, 80);
 }
 
@@ -899,9 +991,9 @@ async function refreshPreview(): Promise<boolean> {
     return true;
   } catch (cause) {
     if (revision === contextRevision) {
-      previewError.value = cause instanceof Error ? cause.message : "打印预览生成失败";
+      previewError.value = describeError(cause, "打印预览生成失败");
       previewHtml.value = "";
-      status.value = "预览未生成，可点击「重试预览」";
+      showCopy("error.preview.refresh");
     }
     return false;
   } finally {
@@ -921,8 +1013,8 @@ function markDesignerReady() {
     stopDataSourceEditingLifecycle = installDataSourceEditingLifecycle(designerRef.value, {
       onChange: refreshTemplateDirtyState,
       onError: (cause) => {
-        error.value = cause.message;
-        status.value = "字段内容未更新到模板，请重试";
+        error.value = sanitizeForUser(cause);
+        showCopy("warn.template.dataSyncFailed");
       },
     });
     stopDesignerTemplatePanelSuppression = installDesignerTemplatePanelSuppression(window);
@@ -935,8 +1027,8 @@ function markDesignerReady() {
 
 function handleDesignerLoadError(event: Event) {
   const cause = (event as CustomEvent<unknown>).detail;
-  error.value = cause instanceof Error ? cause.message : "打印设计器资源加载失败";
-  status.value = "打印设计器加载失败，请检查网络后重新打开插件";
+  error.value = sanitizeForUser(cause);
+  showCopy("error.designer.load");
 }
 
 async function previewOutput() {
@@ -946,16 +1038,24 @@ async function previewOutput() {
 
 async function saveTemplate(options: { returnToPreview?: boolean; allowContextChange?: boolean } = {}): Promise<boolean> {
   if (!designerRef.value || !selection.value || !templateSaveAllowed.value
-    || (workspaceMode.value !== "edit" && !options.returnToPreview)) return false;
+    || busy.value || (workspaceMode.value !== "edit" && !options.returnToPreview)) return false;
   closeTransientMenus();
   const active = selection.value;
   const revision = contextRevision;
   const batchEditing = isBatchMode.value;
   busy.value = true;
+  savingTemplate.value = batchEditing;
   error.value = "";
+  if (batchEditing) showStatus("正在保存模板…", "progress");
   try {
     if (!options.allowContextChange) await assertCurrentContext(active, revision);
-    if (batchEditing) await flushBatchProjectionSync();
+    if (batchEditing) {
+      // 读取持久化快照时会调和批量投影；保存不必重新加载可见画布。
+      if (batchProjectionSyncTimer) {
+        clearTimeout(batchProjectionSyncTimer);
+        batchProjectionSyncTimer = undefined;
+      }
+    }
     const id = draftTemplateId.value ?? (selectedTemplateId.value === "automatic"
       ? generateUuid() : selectedTemplateId.value);
     if (!id) throw new Error("请先选择模板");
@@ -974,7 +1074,13 @@ async function saveTemplate(options: { returnToPreview?: boolean; allowContextCh
       const updated = await templateRepository.upsert(
         { baseId: active.baseId, tableId: active.tableId },
         persistentTemplate,
-        { id, name: currentTemplateName.value, expectedRevision: templateCollection.value.revision },
+        {
+          id, name: currentTemplateName.value, expectedRevision: templateCollection.value.revision,
+          // 带图片的模板分片多、批量保存耗时长，分批进度让「还在保存」可见，避免误判卡死。
+          onProgress: (done, total) => {
+            if (done < total) showStatus(`正在保存模板 ${done}/${total}`, "progress");
+          },
+        },
       );
       if (!options.allowContextChange) await assertCurrentContext(active, revision);
       return updated;
@@ -987,8 +1093,14 @@ async function saveTemplate(options: { returnToPreview?: boolean; allowContextCh
       const result = await commitBatchTemplateEdit({
         previousRendered: renderedPages.value,
         persist,
-        render: () => renderPrintJobPages(designerRef.value!, printJob.value!, undefined,
-          () => revision === contextRevision),
+        // 落库成功后先显示预览加载态，再在隐藏画布上逐条渲染。
+        render: async () => {
+          batchSavePreviewPending.value = true;
+          workspaceMode.value = "preview";
+          await nextTick();
+          return renderPrintJobPages(designerRef.value!, printJob.value!, undefined,
+            () => revision === contextRevision);
+        },
       });
       updated = result.saved;
       renderedBatch = result.rendered;
@@ -1011,6 +1123,7 @@ async function saveTemplate(options: { returnToPreview?: boolean; allowContextCh
       // 保存会把画布规范化（表格行转存为模板行、清掉运行时记录值）。用落库结果
       // 重建一次画布，让"保存后看到的"与"重新打开看到的"保持一致，避免模板内容
       // 实际已丢失却要等到下次重载才暴露。
+      canvasRebinding.value = true;
       try {
         const rebound = ensureBatchLayout(
           saved.template,
@@ -1018,42 +1131,51 @@ async function saveTemplate(options: { returnToPreview?: boolean; allowContextCh
           () => generateLabelTemplate(printJob.value!),
           () => generateTemplate(printJob.value!),
         ).effectiveTemplate;
+        // 先等遮罩上屏再 loadTemplateData，确保中间帧被遮住；绑定完成后再等一帧，
+        // 让 setVariables 注入的最终内容先渲染出来。
+        await nextTick();
         await bindPrintJob(designerRef.value, rebound, printJob.value);
+        await nextTick();
       } catch (cause) {
         canvasRebindFailed = true;
-        const detail = cause instanceof Error ? cause.message : "编辑画布未能重新加载";
+        const detail = describeError(cause, "编辑画布没能重新加载");
         templateWarning.value = `模板已保存，但编辑画布未与存储同步：${detail}`;
+      } finally {
+        canvasRebinding.value = false;
       }
     }
     // The editor can keep a bound runtime projection after persistence. Compare
     // future edits with that same live projection, not the stored canonical data.
     // 画布重建失败时以落库模板为基线，让画布差异显示为未保存修改。
     captureTemplateBaseline(canvasRebindFailed ? saved.template : undefined);
-    status.value = "模板已保存";
+    showCopy("status.save.saved");
     if (batchEditing && renderFailure) {
       batchPreviewStale.value = true;
-      error.value = `模板已保存，但批量预览刷新失败：${renderFailure.message}`;
-      status.value = "模板已保存，批量预览暂未刷新，可点击重试";
+      error.value = sanitizeForUser(renderFailure);
+      showCopy("status.save.previewStale");
       return false;
     }
     if (renderedBatch) {
+      const nextPreviewHtml = composeRenderedPrintPages(renderedBatch);
       renderedPages.value = renderedBatch;
-      previewHtml.value = composeRenderedPrintPages(renderedBatch);
+      previewHtml.value = nextPreviewHtml;
       previewError.value = "";
       batchPreviewStale.value = false;
       workspaceMode.value = "preview";
-      status.value = `模板已保存，${batchSession.value.committedRecordIds.length} 条记录预览已同步刷新`;
+      showCopy("status.save.batchRefreshed", { count: batchSession.value.committedRecordIds.length });
     } else if (options.returnToPreview) {
       workspaceMode.value = "preview";
     }
     return true;
   } catch (cause) {
     if (revision === contextRevision) {
-      error.value = cause instanceof Error ? cause.message : "打印模板保存失败";
-      status.value = "未能保存，修改仍在画布中，请重试";
+      error.value = sanitizeForUser(cause);
+      showCopy("status.save.failed");
     }
     return false;
   } finally {
+    batchSavePreviewPending.value = false;
+    savingTemplate.value = false;
     busy.value = false;
   }
 }
@@ -1083,7 +1205,7 @@ async function createTemplate(
   try {
     if (exitsOwnedBatch) {
       const currentIds = getCurrentRecordIds(active);
-      if (!currentIds.length) throw new Error("当前宿主记录不可用；原批次已保留");
+      if (!currentIds.length) throw new Error("当前记录不可用；原批次已保留");
       job = await loadPrintJob(active, currentIds);
       await assertCurrentContext(active, revision);
     }
@@ -1128,13 +1250,16 @@ async function createTemplate(
     captureTemplateBaseline();
     workspaceMode.value = "edit";
     activeEditorPanel.value = "data-sources";
-    const createdStatus = kind === "blank" ? "已新建空白模板，保存后生效" : "已自动生成新模板，保存后生效";
-    status.value = exitsOwnedBatch ? `已退出批量打印；${createdStatus}` : createdStatus;
+    const createdCopy = kind === "blank"
+      ? "status.template.createDraftBlank"
+      : "status.template.createDraftAuto";
+    if (exitsOwnedBatch) showCopy("status.template.createdFromBatch", { result: feedbackText(createdCopy) });
+    else showCopy(createdCopy);
   } catch (cause) {
-    const message = cause instanceof Error ? cause.message : "新模板创建失败";
-    error.value = message;
-    templateCreateError.value = message;
-    status.value = "模板创建失败，可点击「重试创建」";
+    const reason = sanitizeForUser(cause);
+    error.value = reason;
+    templateCreateError.value = reason;
+    showCopy("error.template.create");
   } finally {
     busy.value = false;
   }
@@ -1143,13 +1268,13 @@ async function createTemplate(
 async function changeBatchLayout(mode: BatchLayoutMode) {
   if (!isBatchMode.value || !designerRef.value || !printJob.value || !selection.value) return;
   if (!storedTemplate.value || selectedTemplateId.value === "automatic" || draftTemplateId.value) {
-    status.value = "请先保存模板，再切换批量排版";
+    showCopy("warn.template.saveFirst");
     return;
   }
   if (mode === currentBatchLayout.value) return;
   if (busy.value) return;
   if (workspaceMode.value === "edit" && refreshTemplateDirtyState()) {
-    status.value = "请先保存模板，再切换批量排版";
+    showCopy("warn.template.saveFirstForSwitch");
     return;
   }
 
@@ -1190,15 +1315,16 @@ async function changeBatchLayout(mode: BatchLayoutMode) {
       prepareEditableProjection: wasEditing
         ? () => bindBatchEditProjection(designer, candidate.effectiveTemplate, job, mode)
         : undefined,
-      persistCandidate: () => templateRepository.upsert(
-        { baseId: active.baseId, tableId: active.tableId },
-        candidate.persistentTemplate,
-        {
-          id: previous.id,
-          name: previous.name,
-          expectedRevision: templateCollection.value.revision,
-        },
-      ),
+      persistCandidate: async () =>
+        templateRepository.upsert(
+          { baseId: active.baseId, tableId: active.tableId },
+          candidate.persistentTemplate,
+          {
+            id: previous.id,
+            name: previous.name,
+            expectedRevision: templateCollection.value.revision,
+          },
+        ),
       restoreCommitted: async () => {
         if (revision !== contextRevision) return;
         await bindPrintJob(designer, previousLayout.effectiveTemplate, job);
@@ -1222,10 +1348,12 @@ async function changeBatchLayout(mode: BatchLayoutMode) {
       captureTemplateBaseline();
       templateDirty.value = false;
     }
-    status.value = `已切换为 ${BATCH_LAYOUT_OPTIONS.find((item) => item.kind === mode)?.label} 排版`;
+    showCopy("status.template.layoutChanged", {
+      layout: BATCH_LAYOUT_OPTIONS.find((item) => item.kind === mode)?.label ?? "默认排版",
+    });
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : "批量排版切换失败";
-    status.value = "排版未切换，模板与预览保持不变";
+    error.value = sanitizeForUser(cause);
+    showCopy("warn.template.layoutUnchanged");
   } finally {
     if (revision === contextRevision) busy.value = false;
   }
@@ -1266,7 +1394,7 @@ async function selectTemplate(id: string): Promise<boolean> {
     }
     if (!savedIds.length && batchSession.value.mode === "batch") {
       const currentIds = getCurrentRecordIds(active);
-      if (!currentIds.length) throw new Error("当前宿主记录不可用；原批次已保留");
+      if (!currentIds.length) throw new Error("当前记录不可用；原批次已保留");
       job = await loadPrintJob(active, currentIds);
       await assertCurrentContext(active, revision);
     }
@@ -1322,19 +1450,19 @@ async function selectTemplate(id: string): Promise<boolean> {
     templateDirty.value = false;
     captureTemplateBaseline();
     templateWarning.value = restoreWarning
-      ? `当前模板保存的打印记录暂时不可用：${restoreWarning}；已显示当前记录`
+      ? `当前模板保存的打印记录暂时读不到：${sanitizeForUser(restoreWarning)}；已显示当前记录`
       : "";
     renderedPages.value = candidate.rendered;
     previewHtml.value = composeRenderedPrintPages(candidate.rendered);
     batchPreviewStale.value = false;
     if (restoreWarning) {
-      status.value = "已切换模板；保存的打印记录暂时不可用";
+      showCopy("warn.template.recordsUnavailable");
     }
     return true;
   } catch (cause) {
     if (revision === contextRevision) {
-      error.value = cause instanceof Error ? cause.message : "模板切换失败";
-      status.value = "模板未切换，原预览保持不变";
+      error.value = sanitizeForUser(cause);
+      showCopy("warn.template.switchFailed");
     }
     return false;
   } finally {
@@ -1369,8 +1497,8 @@ async function updateDirectory(
       nextSelection = updated.defaultId ?? "automatic";
     }
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : "模板目录操作失败";
-    status.value = "操作未完成，模板列表未变化";
+    error.value = sanitizeForUser(cause);
+    showCopy("error.directory.update");
     return false;
   } finally {
     busy.value = false;
@@ -1407,7 +1535,7 @@ function requestTemplateSelection(id: string) {
   if (shouldGuardUnsavedNavigation(refreshTemplateDirtyState())) {
     pendingPreviewTemplateId.value = id;
     decisionDialog.value = "leave";
-    status.value = "模板有未保存的修改，请先保存或放弃";
+    showCopy("warn.template.unsavedBeforeSwitch");
     return;
   }
   void selectTemplate(id);
@@ -1455,14 +1583,14 @@ async function confirmTemplateManagement() {
 
 async function enterEditMode() {
   if (isBatchMode.value && !renderedPages.value) {
-    status.value = "批量预览生成中，请稍候";
+    showCopy("warn.batch.previewPending");
     return;
   }
   if (!canEnterTemplateEdit({
     templateLoaded: templateLoaded.value,
     templateSelected: templateSelected.value,
   })) {
-    status.value = "请先在左侧选择要编辑的模板";
+    showCopy("warn.template.noneSelected");
     return;
   }
   closeTransientMenus();
@@ -1499,8 +1627,8 @@ async function enterEditMode() {
     } catch {
       // The committed preview remains visible even if the hidden designer cannot be restored.
     }
-    error.value = cause instanceof Error ? cause.message : "模板编辑画布加载失败";
-    status.value = "无法打开编辑画布，预览保持不变，可重试";
+    error.value = sanitizeForUser(cause);
+    showCopy("warn.edit.failed");
   } finally {
     if (revision === contextRevision) busy.value = false;
   }
@@ -1559,13 +1687,11 @@ async function restoreBatchEditBaseline(): Promise<boolean> {
       batchPreviewStale.value = false;
     }
     workspaceMode.value = "preview";
-    status.value = "已放弃修改，返回批量预览";
+    showCopy("status.edit.discarded");
     return true;
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : "无法恢复保存前的批量模板";
-    status.value = baselineRestored
-      ? "修改已放弃，批量预览未刷新，可重试或继续编辑"
-      : "修改已保留，未放弃";
+    error.value = sanitizeForUser(cause);
+    showCopy(baselineRestored ? "warn.edit.discardedStale" : "warn.template.draftKept");
     return false;
   } finally {
     busy.value = false;
@@ -1591,11 +1717,13 @@ async function refreshStaleBatchPreview(): Promise<boolean> {
     previewError.value = "";
     batchPreviewStale.value = false;
     workspaceMode.value = "preview";
-    status.value = `已刷新 ${batchSession.value.committedRecordIds.length} 条记录的预览`;
+    showCopy("status.preview.batchRefreshed", {
+      count: batchSession.value.committedRecordIds.length,
+    });
     return true;
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : "批量预览刷新失败";
-    status.value = "批量预览未刷新，可重试或继续编辑";
+    error.value = sanitizeForUser(cause);
+    showCopy("warn.preview.kept");
     return false;
   } finally {
     busy.value = false;
@@ -1645,7 +1773,7 @@ function requestTemplateReload() {
  */
 async function chooseRecords() {
   if (busy.value) {
-    status.value = "正在处理，完成后可选择记录";
+    showCopy("hint.busy");
     return;
   }
   if (shouldGuardUnsavedNavigation(refreshTemplateDirtyState())) {
@@ -1662,8 +1790,8 @@ async function chooseRecords() {
     ids = await selectRecordIds(active);
   } catch (cause) {
     busy.value = false;
-    error.value = cause instanceof Error ? cause.message : "选择记录失败";
-    status.value = "记录选择未完成，批量打印保持不变";
+    error.value = sanitizeForUser(cause);
+    showCopy("error.batch.readFailed");
     return;
   }
   if (!ids.length) {
@@ -1711,7 +1839,7 @@ async function resolveDecision(decision: "save" | "discard" | "cancel") {
   if (!action || decision === "cancel") {
     if (decision === "cancel") {
       if (action === "context") {
-        status.value = contextDecisionCancelStatus(pendingLoadRequest.value);
+        showCopy(contextDecisionCancelStatusCode(pendingLoadRequest.value));
       }
       pendingContext.value = null;
       pendingLoadRequest.value = null;
@@ -1802,12 +1930,12 @@ async function copyDataSource(source: { id: string; label: string }) {
     copiedSourceId.value = source.id;
     window.setTimeout(() => { if (copiedSourceId.value === source.id) copiedSourceId.value = ""; }, 1800);
     if (designerRef.value) rememberCopiedDataSource(designerRef.value, payload);
-    status.value = source.id.includes(".__duowei_column_")
-      ? `已复制“${source.label}”，右键表格单元格选择“粘贴”即可`
-      : `已复制“${source.label}”，右键文本组件选择“粘贴”即可`;
+    showCopy(source.id.includes(".__duowei_column_")
+      ? "status.source.copiedCell"
+      : "status.source.copiedText", { name: source.label });
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : "数据源复制失败";
-    status.value = "数据源复制失败";
+    error.value = sanitizeForUser(cause);
+    showCopy("error.source.copy");
   }
 }
 
@@ -1832,10 +1960,11 @@ async function printOutput() {
     }
     await printRenderedPages(rendered!);
     await assertCurrentContext(active, revision);
+    showCopy("status.output.printStarted");
   } catch (cause) {
     if (revision === contextRevision) {
-      error.value = cause instanceof Error ? cause.message : "浏览器打印失败";
-      status.value = "未能打开打印窗口，请重试";
+      error.value = sanitizeForUser(cause);
+      showCopy("warn.output.printIncomplete");
     }
   } finally {
     busy.value = false;
@@ -1859,24 +1988,19 @@ async function exportPdf() {
     const size = result.bytes >= 1024
       ? `${(result.bytes / 1024).toFixed(1)} KB`
       : `${result.bytes} B`;
-    const paper = result.pageSizes?.length === result.pages
-      ? result.pageSizes.every((page) => page.width === result.pageSizes![0].width
-        && page.height === result.pageSizes![0].height)
-        ? `，纸张 ${result.pageSizes[0].width.toFixed(1)}×${result.pageSizes[0].height.toFixed(1)} pt`
-        : "，纸张尺寸多种"
-      : "";
-    status.value = `PDF 已生成（${result.pages} 页，${size}${paper}），开始下载`;
+    // 纸张 pt 与小数尺寸属于工程信息，对办公人员无意义，气泡只报页数与体积
+    showCopy("status.output.pdfReady", { pages: result.pages, size });
   } catch (cause) {
     if (revision === contextRevision) {
-      error.value = cause instanceof Error ? cause.message : "PDF 导出失败";
-      status.value = "PDF 导出失败，请重试";
+      error.value = sanitizeForUser(cause);
+      showCopy("warn.output.pdfIncomplete");
     }
   } finally {
     busy.value = false;
   }
 }
 
-const readOnlyToast = "没有编辑权限，无法修改模板或打印";
+const readOnlyToast = feedbackText("status.permission.readonly");
 let firstLoadDone = false;
 let readOnlyToastPending = false;
 
@@ -1884,13 +2008,13 @@ let readOnlyToastPending = false;
 function flushReadOnlyToast() {
   if (!readOnlyToastPending || !firstLoadDone) return;
   readOnlyToastPending = false;
-  status.value = readOnlyToast;
-  // 与提示条同步收起（沿用 watch(status) 的 2600ms 节奏）
-  readOnlyNotice.value = true;
+  // 权限说明不是故障：信息态上屏，并单独计时收起，不占用 error 通道
+  readOnlyNotice.value = readOnlyToast;
+  showStatus(readOnlyToast, "info");
   if (readOnlyNoticeTimer) clearTimeout(readOnlyNoticeTimer);
   readOnlyNoticeTimer = setTimeout(() => {
-    readOnlyNotice.value = false;
-  }, 2600);
+    readOnlyNotice.value = "";
+  }, durationFor("info", readOnlyToast));
 }
 
 /**
@@ -1916,8 +2040,9 @@ function handleUnhandledResourceRejection(event: PromiseRejectionEvent) {
   if (source === null) return;
   event.preventDefault();
   event.stopImmediatePropagation();
-  console.warn("[多维打印] 图片资源加载失败，相关区域按空白输出：", source || "unknown");
-  status.value = "图片未能加载，相关区域按空白输出";
+  console.warn("[多维打印] 图片资源加载失败，对应位置留空：", source || "unknown");
+  // 「按空白输出」是实现视角的说法，办公人员只需要知道图片没出来、版式不受影响
+  showStatus("图片加载失败，对应位置留空", "warning");
 }
 
 /** 探测编辑权限；只读时由 writeActionsDisabled 与 batch-workspace-action-state 统一置灰，并提示一次 */
@@ -1959,7 +2084,7 @@ onMounted(() => {
         : null;
       pendingLoadRequest.value = null;
       decisionDialog.value = "context";
-      status.value = "已切换记录，请先保存或放弃当前修改";
+      showCopy("warn.template.recordSwitchedDirty");
       return;
     }
     invalidateContext();
@@ -2005,23 +2130,27 @@ onBeforeUnmount(() => {
       </div>
     </header>
 
-    <div v-if="showStatusFeedback" class="status-line" :class="{ 'status-line-error': statusLineError, 'status-line-loading': busy && !statusLineError }"
+    <div v-if="showStatusFeedback" class="status-line" :class="`status-line-${statusLineTone}`"
       :role="statusLineError ? 'alert' : 'status'" aria-live="polite">
       <svg class="status-indicator" viewBox="0 0 20 20" aria-hidden="true">
-        <template v-if="statusLineError">
+        <template v-if="statusLineTone === 'error' || statusLineTone === 'warning'">
           <circle cx="10" cy="10" r="9" fill="currentColor" />
           <path d="M10 5.5v5M10 14v.1" stroke="white" stroke-width="1.8" stroke-linecap="round" />
         </template>
-        <circle v-else-if="busy" cx="10" cy="10" r="7.5" fill="none" stroke="currentColor" stroke-width="2" stroke-dasharray="34 14" />
+        <circle v-else-if="statusLineTone === 'progress'" cx="10" cy="10" r="7.5" fill="none"
+          stroke="currentColor" stroke-width="2" stroke-dasharray="34 14" />
+        <template v-else-if="statusLineTone === 'info'">
+          <circle cx="10" cy="10" r="9" fill="currentColor" />
+          <path d="M10 9.2v4.9" stroke="white" stroke-width="1.8" stroke-linecap="round" />
+          <circle cx="10" cy="6.3" r="1.1" fill="white" />
+        </template>
         <template v-else>
           <circle cx="10" cy="10" r="9" fill="currentColor" />
           <path d="m6 10 2.5 2.5L14 7" fill="none" stroke="white" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
         </template>
       </svg>
-      <span>{{ status }}</span>
-      <span v-if="templateWarning">模板：{{ templateWarning }}</span>
-      <span v-if="previewError">预览：{{ previewError }}</span>
-      <span v-if="error">{{ error }}</span>
+      <span v-if="statusFeedback.primary" class="status-primary">{{ statusFeedback.primary }}</span>
+      <span v-if="statusFeedback.detail" class="status-detail">{{ statusFeedback.detail }}</span>
       <button v-if="showBatchRetry" class="status-retry-button" type="button"
         @click="retryBatchCandidate">重试批量读取</button>
     </div>
@@ -2072,7 +2201,7 @@ onBeforeUnmount(() => {
               >
                 <span class="template-item-copy">
                   <strong>自动模板</strong>
-                  <small>{{ templateFallback ? '只读回退' : '未保存' }}</small>
+                  <small>{{ templateFallback ? feedbackText("label.template.fallback") : '未保存' }}</small>
                 </span>
               </button>
             </template>
@@ -2218,7 +2347,8 @@ onBeforeUnmount(() => {
               :title="writeActionsHint" @click="enterEditMode">编辑模板</button>
             <button v-if="presentation.showSave" class="button button-primary"
               :disabled="writeActionsDisabled || !templateSaveAllowed" :title="writeActionsHint"
-              @click="saveTemplate()">保存模板</button>
+              :aria-busy="savingTemplate" @click="saveTemplate()"><span v-if="savingTemplate" class="save-button-spinner"
+                aria-hidden="true"></span>{{ savingTemplate ? '保存中…' : '保存模板' }}</button>
           </div>
         </header>
 
@@ -2228,19 +2358,25 @@ onBeforeUnmount(() => {
             :inert="!presentation.showDesigner ? true : undefined">
             <print-designer ref="designerRef" lang="zh" @ready="markDesignerReady" />
           </div>
+          <div v-if="canvasRebinding" class="canvas-rebind-mask" aria-hidden="true">
+            <span class="canvas-rebind-hint">{{ feedbackText("label.sync.canvas") }}</span>
+          </div>
           <section v-if="presentation.showPreview" ref="previewSurfaceRef" class="preview-surface" aria-label="打印预览">
-            <div v-if="previewHtml" class="preview-paper-wrap">
+            <div v-if="batchPreviewStale && !batchSavePreviewPending" class="preview-stale-action">
+              <button class="button button-outline" type="button" :disabled="busy" @click="refreshStaleBatchPreview">批量预览未刷新，点击重试</button>
+            </div>
+            <div v-if="previewHtml && !batchSavePreviewPending" class="preview-paper-wrap">
               <div class="preview-paper-size" :style="previewPaperStyle">
                 <iframe :srcdoc="previewHtml" :style="previewFrameStyle" title="打印预览"
                   class="preview-frame" scrolling="no" />
               </div>
             </div>
             <div v-else class="preview-empty">
-              <strong>{{ !hasSelectedRecord ? '请选择记录' : previewError ? '打印预览生成失败' : '正在生成打印预览' }}</strong>
+              <strong>{{ batchSavePreviewPending ? '正在生成批量预览' : !hasSelectedRecord ? '请选择记录' : emptyPreviewCopy.title }}</strong>
               <span v-if="!hasSelectedRecord">请先点击「选择记录」勾选需要打印的记录</span>
-              <span v-else-if="previewError">{{ previewError }}</span>
-              <span v-else-if="!templateLoaded">读取当前记录与模板中</span>
-              <button v-if="previewError && hasSelectedRecord" class="button button-outline" :disabled="busy" @click="previewOutput">重试预览</button>
+              <span v-else-if="!batchSavePreviewPending && previewError">{{ previewError }}</span>
+              <span v-else-if="!batchSavePreviewPending && emptyPreviewCopy.hint">{{ emptyPreviewCopy.hint }}</span>
+              <button v-if="!batchSavePreviewPending && previewError && hasSelectedRecord" class="button button-outline" :disabled="busy" @click="previewOutput">重试预览</button>
             </div>
           </section>
         </div>
@@ -2258,18 +2394,16 @@ onBeforeUnmount(() => {
     >
       <div ref="templateManagementCardRef" class="decision-card template-management-card"
         @keydown.tab="trapTemplateManagementFocus">
-        <h2 id="template-management-title">
-          {{ templateManagementDialog.action === "rename" ? "重命名模板" : "删除模板" }}
-        </h2>
+        <h2 id="template-management-title">{{ templateManagementCopy.title }}</h2>
         <template v-if="templateManagementDialog.action === 'rename'">
-          <p id="template-management-description">输入一个便于识别的模板名称。</p>
+          <p id="template-management-description">{{ templateManagementCopy.body }}</p>
           <label class="template-name-field">
             <span>模板名称</span>
             <input ref="templateRenameInputRef" v-model="templateRenameInput" class="template-name-input"
               aria-label="模板名称" maxlength="50" @keydown.enter.prevent="confirmTemplateManagement" />
           </label>
         </template>
-        <p v-else id="template-management-description">删除“{{ templateManagementDialog.item.name }}”后无法恢复，其他模板不会受影响。</p>
+        <p v-else id="template-management-description">{{ templateManagementCopy.body }}</p>
         <div class="decision-actions">
           <button ref="templateManagementCancelRef" type="button" class="button button-quiet" :disabled="busy"
             @click="closeTemplateManagementDialog">取消</button>
@@ -2291,10 +2425,8 @@ onBeforeUnmount(() => {
       aria-labelledby="unsaved-title"
     >
       <div class="decision-card">
-        <h2 id="unsaved-title">模板有未保存修改</h2>
-        <p v-if="decisionDialog === 'leave'">返回预览前，请先决定是否保存当前模板。</p>
-        <p v-else-if="decisionDialog === 'reload'">重新加载会覆盖当前模板草稿。</p>
-        <p v-else>读取其他记录或上下文前，请先处理当前模板草稿。</p>
+        <h2 id="unsaved-title">{{ decisionCopy.title }}</h2>
+        <p>{{ decisionCopy.body }}</p>
         <div class="decision-actions">
           <button class="button button-quiet" :disabled="busy" @click="resolveDecision('cancel')">继续编辑</button>
           <button class="button button-outline" :disabled="busy" @click="resolveDecision('discard')">放弃修改</button>
@@ -2392,6 +2524,7 @@ onBeforeUnmount(() => {
 .button-primary { border-color: var(--ui-primary); background: var(--ui-primary); color: #fff; }
 .button-primary:hover:not(:disabled) { border-color: var(--ui-primary-hover); background: var(--ui-primary-hover); }
 .button-primary:active:not(:disabled) { border-color: var(--ui-primary-pressed); background: var(--ui-primary-pressed); }
+.save-button-spinner { display: inline-block; width: 12px; height: 12px; flex: 0 0 12px; margin-right: 6px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; vertical-align: -2px; animation: status-spin .8s linear infinite; }
 .button-danger { border-color: var(--ui-danger); background: var(--ui-danger); color: #fff; }
 .button-danger:hover:not(:disabled) { border-color: #b42318; background: #b42318; }
 .button-secondary, .button-outline { border-color: var(--ui-border); background: #fff; }
@@ -2403,9 +2536,14 @@ onBeforeUnmount(() => {
   z-index: 60;
   left: 50%;
   top: 112px;
+  /* 宽度按内容收缩再受上限约束：缺省 auto 时长主行会被次行的 100% 基宽挤成一字一行。 */
+  width: max-content;
   max-width: min(620px, calc(100vw - 24px));
+  box-sizing: border-box;
   min-height: 36px;
   display: flex;
+  /* 次行 flex-basis 为 100%，必须允许换行才真的独占一行（否则挤压主行）。 */
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
   padding: 12px 16px;
@@ -2421,8 +2559,26 @@ onBeforeUnmount(() => {
 }
 .status-indicator { width: 18px; height: 18px; flex: 0 0 18px; color: #2ea121; }
 .status-line-error .status-indicator { color: var(--ui-danger); }
-.status-line-loading .status-indicator { color: var(--ui-primary); animation: status-spin .8s linear infinite; }
+.status-line-warning .status-indicator { color: var(--ui-warning); }
+.status-line-info .status-indicator { color: var(--ui-primary); }
+.status-line-success .status-indicator { color: #2ea121; }
+.status-line-progress .status-indicator { color: var(--ui-primary); animation: status-spin .8s linear infinite; }
 @keyframes status-spin { to { transform: rotate(360deg); } }
+.status-primary { flex: 1 1 auto; min-width: 0; }
+/* 次行是原因，单行省略，不把气泡撑高；order 让它排在按钮之后独占一行 */
+.status-detail {
+  order: 1;
+  flex: 0 0 100%;
+  box-sizing: border-box;
+  min-width: 0;
+  padding-left: 26px;
+  color: var(--ui-text-secondary);
+  font-size: 13px;
+  line-height: 18px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .status-retry-button { border: 0; padding: 0 2px; background: transparent; color: var(--ui-primary); font: inherit; font-weight: 500; cursor: pointer; }
 .status-retry-button:hover { color: var(--ui-primary-hover); }
 .workspace {
@@ -2515,8 +2671,11 @@ onBeforeUnmount(() => {
 .canvas-stage { position: relative; flex: 1; height: 100%; min-height: 0; overflow: hidden; background: var(--ui-workspace); }
 .designer-host { position: absolute; z-index: 1; inset: 0; height: 100%; min-height: 0; overflow: hidden; background: #fff; opacity: 1; }
 .designer-host-preview { opacity: 0; pointer-events: none; }
+.canvas-rebind-mask { position: absolute; z-index: 3; inset: 0; display: grid; place-items: center; background: rgba(255, 255, 255, 0.72); pointer-events: none; }
+.canvas-rebind-hint { padding: 6px 14px; border-radius: 999px; background: rgba(31, 35, 41, 0.78); color: #fff; font-size: 12px; line-height: 18px; }
 .designer-host print-designer { display: block; width: 100%; height: 100%; min-height: 0; }
 .preview-surface { position: absolute; z-index: 2; inset: 0; overflow: auto; padding: 18px 16px 0; background: var(--ui-workspace); scrollbar-width: thin; }
+.preview-stale-action { position: sticky; z-index: 1; top: 0; display: flex; justify-content: center; padding-bottom: 12px; }
 .preview-paper-wrap { min-height: 100%; display: flex; justify-content: center; align-items: flex-start; }
 .preview-paper-size { position: relative; flex: 0 0 auto; }
 .preview-frame { position: absolute; top: 0; left: 0; display: block; overflow: hidden; border: 0; background: transparent; box-shadow: none; transform-origin: top left; }
@@ -2555,7 +2714,8 @@ onBeforeUnmount(() => {
 }
 @media (prefers-reduced-motion: reduce) {
   .button { transition: none; }
-  .status-line-loading .status-indicator { animation: none; }
+  .status-line-progress .status-indicator { animation: none; }
+  .save-button-spinner { animation: none; }
 }
 /* 侧边栏窄容器降级：极窄时模板/操作区改为顶部堆叠，画布占满剩余高度 */
 @media (max-width: 430px) {
